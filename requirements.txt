@@ -1,0 +1,8 @@
+telethon
+pillow
+python-dotenv
+aiosqlite
+pyahocorasick
+imagehash
+piexif
+pytz

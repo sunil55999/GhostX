@@ -4,1584 +4,958 @@ import json
 import re
 import shutil
 import random
-import string
-import hashlib
-import aiosqlite
+import os
 import signal
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import deque
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 from telethon import TelegramClient, events, errors
-from telethon.tl.types import MessageMediaPhoto, MessageMediaDocument, MessageEntity
+from telethon.tl.types import (
+    MessageEntityBankCard, MessageEntityBlockquote, MessageEntityBold,
+    MessageEntityBotCommand, MessageEntityCashtag, MessageEntityCode,
+    MessageEntityCustomEmoji, MessageEntityEmail, MessageEntityHashtag,
+    MessageEntityItalic, MessageEntityMention, MessageEntityMentionName,
+    MessageEntityPhone, MessageEntityPre, MessageEntitySpoiler,
+    MessageEntityStrike, MessageEntityTextUrl, MessageEntityUnderline,
+    MessageEntityUnknown, MessageEntityUrl, MessageMediaPhoto, MessageMediaDocument
+)
 from PIL import Image
 import io
-import imagehash
-import pyahocorasick
-import os
 from dotenv import load_dotenv
-from difflib import SequenceMatcher
+import pytz
+from datetime import time
 
-# Configuration
+# Custom Modules
+import reply_mapper
+import trap_filter
+import stealth_utils
+
+# --- Configuration ---
 load_dotenv()
-API_ID = os.getenv('API_ID')
-API_HASH = os.getenv('API_HASH')
-OWNER_ID_ENV = os.getenv('OWNER_ID')
-if not API_ID or not API_HASH:
-    raise ValueError("API_ID and API_HASH must be set in environment variables.")
-API_ID = int(API_ID)
-OWNER_ID = int(OWNER_ID_ENV) if OWNER_ID_ENV else None  # Initialize from .env
+
+# --- File Paths (must be defined before logging setup) ---
 SESSION_FILE = "ghostcopy.session"
 MAPPINGS_FILE = "channel_mappings.json"
-TEMP_DIR = Path("./temp_images")
-OUTPUT_DIR = Path("./output_images")
-CACHE_DB_PATH = "./image_cache.db"
+LOG_FILE = "ghostcopybotpro.log"
+
+# --- Logging Setup (must be before any logging calls) ---
+def setup_logging(stealth=False):
+    """Configure logging based on stealth mode."""
+    global STEALTH_MODE
+    STEALTH_MODE = stealth
+    
+    # Clear existing handlers
+    root_logger = logging.getLogger()
+    for handler in root_logger.handlers[:]:
+        root_logger.removeHandler(handler)
+
+    log_level = logging.WARNING if stealth else logging.INFO
+    log_format = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+
+    # General log handler
+    main_handler = logging.FileHandler(LOG_FILE)
+    main_handler.setLevel(log_level)
+    main_handler.setFormatter(log_format)
+    
+    # Failure log handler
+    failure_handler = logging.FileHandler("copy_failures.log")
+    failure_handler.setLevel(logging.ERROR)
+    failure_handler.setFormatter(log_format)
+
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(log_format)
+
+    root_logger.setLevel(log_level)
+    root_logger.addHandler(main_handler)
+    root_logger.addHandler(failure_handler)
+    root_logger.addHandler(console_handler)
+    
+    logging.getLogger('telethon').setLevel(logging.WARNING)
+    global logger
+    logger = logging.getLogger("GhostCopyBotPro")
+    logger.info(f"Logging initialized. Stealth mode: {'ON' if stealth else 'OFF'}")
+
+setup_logging()  # Initialize logging before any log calls
+logger = logging.getLogger("GhostCopyBotPro")
+
+API_ID = os.getenv('API_ID')
+API_HASH = os.getenv('API_HASH')
+# OWNER_ID = os.getenv('OWNER_ID')
+# logger.info(f"Loaded OWNER_ID from .env: {OWNER_ID}")
+# if not OWNER_ID:
+#     logger.critical("OWNER_ID not found in environment. Check your .env file location and formatting.")
+#     raise ValueError("OWNER_ID must be set in the .env file. It is required for all bot features.")
+# OWNER_ID = int(OWNER_ID)
+
+# Performance & Limits
 MAX_RETRIES = 3
 RETRY_DELAY = 5
-MAX_QUEUE_SIZE = 100
-MAX_MAPPING_HISTORY = 1000
+MAX_QUEUE_SIZE = 200
+MAX_MAPPING_HISTORY = 2000 # Kept in DB now, this is for local cache if needed
 MAX_MESSAGE_LENGTH = 4096
 NUM_WORKERS = 5
 DEFAULT_DELAY_RANGE = [3.0, 7.0]
-DEFAULT_DELAY_OFFSET = 1.0
-MAX_CHATS_PER_SESSION = 70
+MAX_CHATS_PER_SESSION = 100
 
-# Initialize directories
-TEMP_DIR.mkdir(exist_ok=True)
-OUTPUT_DIR.mkdir(exist_ok=True)
-
-# Logging setup
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    handlers=[logging.FileHandler("ghostcopybotpro.log"), logging.StreamHandler()]
-)
-logger = logging.getLogger("GhostCopyBotPro")
-
-# Initialize single client
-client = TelegramClient(SESSION_FILE, API_ID, API_HASH)
-client.forwarded_messages = {}  # type: Dict[str, int]
-
-# Initialize async SQLite connection
-db_connection = None
-
-async def init_cache_db():
-    """Initialize SQLite database for image cache."""
-    async with aiosqlite.connect(CACHE_DB_PATH) as db:
-        await db.execute("""
-            CREATE TABLE IF NOT EXISTS image_cache (
-                image_hash TEXT PRIMARY KEY,
-                timestamp TEXT
-            )
-        """)
-        await db.commit()
-
-async def is_image_cached(image_hash: str) -> bool:
-    """Check if image hash exists in cache."""
-    async with aiosqlite.connect(CACHE_DB_PATH) as db:
-        async with db.execute("SELECT 1 FROM image_cache WHERE image_hash = ?", (image_hash,)) as cursor:
-            return await cursor.fetchone() is not None
-
-async def cache_image(image_hash: str):
-    """Store image hash in cache with timestamp."""
-    async with aiosqlite.connect(CACHE_DB_PATH) as db:
-        await db.execute(
-            "INSERT OR REPLACE INTO image_cache (image_hash, timestamp) VALUES (?, ?)",
-            (image_hash, datetime.utcnow().isoformat())
-        )
-        await db.commit()
-
-# Data structures
-channel_mappings = {}  # type: Dict[str, Dict[str, Dict[str, Any]]]
-message_queue = deque(maxlen=MAX_QUEUE_SIZE)  # type: deque
+# --- Global State ---
+channel_mappings: Dict[str, Dict[str, Dict[str, Any]]] = {}
+message_queue: deque = deque(maxlen=MAX_QUEUE_SIZE)
 queue_semaphore = asyncio.Semaphore(NUM_WORKERS)
 is_connected = False
 is_processing_enabled = True
-pair_stats = {}  # type: Dict[str, Dict[str, Dict[str, Any]]]
+pair_stats: Dict[str, Dict[str, Dict[str, Any]]] = {}
 shutdown_event = asyncio.Event()
+STEALTH_MODE = False # Toggle for logging
+PAUSE_WINDOW = None # [time, time]
 
-def calculate_image_hash(file_data: bytes) -> str:
-    """Calculate SHA256 hash of image data."""
-    sha256 = hashlib.sha256()
-    sha256.update(file_data)
-    return sha256.hexdigest()
+# --- Header/Footer Removal ---
+HEADER_LIST = []  # Global headers to remove
+FOOTER_LIST = []  # Global footers to remove
+
+# Optionally, store per-pair headers/footers in channel_mappings
+
+def remove_custom_header_footer(text: str, headers: list, footers: list) -> str:
+    """
+    Remove any header at the start and footer at the end of the message.
+    Preserves spacing and formatting as much as possible.
+    """
+    cleaned = text
+    for header in headers:
+        if cleaned.startswith(header):
+            cleaned = cleaned[len(header):].lstrip()
+    for footer in footers:
+        if cleaned.endswith(footer):
+            cleaned = cleaned[:-len(footer)].rstrip()
+    return cleaned
+
+# --- Pause/Resume All Pairs ---
+PAUSE_ALL = False
+PAUSE_ALL_LOG = None
+
+# --- Client Initialization ---
+client = TelegramClient(
+    SESSION_FILE,
+    API_ID,
+    API_HASH,
+    **stealth_utils.get_random_device_info()
+)
+
+# --- Database & Mappings ---
+async def initialize_databases():
+    """Initialize all necessary databases."""
+    await reply_mapper.init_db()
 
 def save_mappings():
     """Save channel mappings to file."""
     try:
         with open(MAPPINGS_FILE, "w") as f:
             json.dump(channel_mappings, f, indent=2)
-        logger.info("Channel mappings saved successfully.")
+        if not STEALTH_MODE:
+            logger.info("Channel mappings saved.")
     except Exception as e:
         logger.error(f"Error saving mappings: {e}")
 
 def load_mappings():
-    """Load channel mappings from file."""
-    global channel_mappings
+    """Load channel mappings from file and set defaults."""
+    global channel_mappings, PAUSE_WINDOW
     try:
         if os.path.exists(MAPPINGS_FILE):
             with open(MAPPINGS_FILE, "r") as f:
-                channel_mappings = json.load(f)
+                data = json.load(f)
+            
+            # Load pause window settings first
+            pause_window_str = data.pop('pause_window', None)
+            if pause_window_str and len(pause_window_str) == 2:
+                try:
+                    PAUSE_WINDOW = [
+                        time.fromisoformat(pause_window_str[0]),
+                        time.fromisoformat(pause_window_str[1])
+                    ]
+                    logger.info(f"Loaded global pause window: {PAUSE_WINDOW[0].strftime('%H:%M')} - {PAUSE_WINDOW[1].strftime('%H:%M')} IST")
+                except (ValueError, TypeError):
+                    logger.error("Invalid pause window format in mappings file. Ignoring.")
+                    PAUSE_WINDOW = None
+
+            channel_mappings = data # The rest is channel mappings
             logger.info(f"Loaded {sum(len(v) for v in channel_mappings.values())} mappings.")
             for user_id, pairs in channel_mappings.items():
-                if user_id not in pair_stats:
-                    pair_stats[user_id] = {}
+                pair_stats.setdefault(user_id, {})
                 for pair_name, mapping in pairs.items():
-                    mapping.setdefault('header_patterns', [])
-                    mapping.setdefault('footer_patterns', [])
-                    mapping.setdefault('remove_phrases', [])
-                    mapping.setdefault('remove_mentions', False)
-                    mapping.setdefault('trap_phrases', [])
-                    mapping.setdefault('honeypot_phrases', ['do_not_copy', 'trapword'])
+                    mapping.setdefault('remove_mentions', True)
+                    mapping.setdefault('trap_phrases', ['do_not_copy', 'trapword'])
+                    mapping.setdefault('honeypot_phrases', [])
                     mapping.setdefault('trap_image_hashes', [])
                     mapping.setdefault('delay_range', DEFAULT_DELAY_RANGE)
-                    mapping.setdefault('delay_offset', DEFAULT_DELAY_OFFSET)
                     mapping.setdefault('status', 'active')
-                    mapping.setdefault('last_activity', None)
-                    mapping.setdefault('custom_header', '')
-                    mapping.setdefault('custom_footer', '')
-                    pair_stats[user_id][pair_name] = {
+                    pair_stats[user_id].setdefault(pair_name, {
                         'forwarded': 0, 'edited': 0, 'deleted': 0, 'blocked': 0, 'queued': 0, 'last_activity': None
-                    }
+                    })
         else:
             logger.info("No mappings file found. Starting fresh.")
-    except json.JSONDecodeError as e:
-        logger.error(f"Corrupted mappings file: {e}. Backing up.")
+    except json.JSONDecodeError:
+        logger.error(f"Corrupted mappings file. Backing up and starting fresh.")
         shutil.move(MAPPINGS_FILE, MAPPINGS_FILE + ".bak")
         channel_mappings = {}
     except Exception as e:
         logger.error(f"Error loading mappings: {e}")
 
-def compile_patterns(patterns: List[str]) -> Optional[re.Pattern]:
-    """Compile regex patterns for filtering with word boundaries."""
-    if not patterns:
-        return None
-    escaped = [r'\b' + re.escape(p.strip().lower()) + r'\b' for p in patterns if p.strip()]
-    return re.compile('|'.join(escaped), re.IGNORECASE) if escaped else None
+# --- Text & Entity Manipulation ---
+def remove_mentions(text: str) -> str:
+    """More robustly removes @mentions and t.me links."""
+    # Regex to find @mentions, t.me links, and user profile links
+    mention_pattern = re.compile(
+        r'(?:\s|^)@\w+|https?://t\.me/(?:[a-zA-Z0-9_]+|joinchat/[a-zA-Z0-9_]+|\+[a-zA-Z0-9_]+)'
+    )
+    return mention_pattern.sub('', text).strip()
 
-def normalize_text(text: str) -> str:
-    """Normalize text by removing invisible characters and extra spaces."""
-    if not text:
-        return ""
-    text = re.sub(r'[\u200B-\u200F\uFEFF]', '', text)
-    text = re.sub(r'\s+', ' ', text).strip()
-    return text
+def adjust_entities(original_text: str, processed_text: str, entities: List[Any]) -> List[Any]:
+    """
+    Adjusts message entities after text modification.
+    This remains a complex problem; a perfect solution is non-trivial.
+    This version tries to be slightly more robust but can still fail on complex edits.
+    """
+    if not entities or not original_text:
+        return []
+    
+    # Create a map of character indices from original to new text
+    s = list(original_text)
+    t = list(processed_text)
+    
+    matcher = SequenceMatcher(None, s, t)
+    
+    mapping = {}
+    for i in range(len(s) + 1):
+        mapping[i] = -1
 
-def remove_patterns(text: str, patterns: List[str]) -> str:
-    """Remove lines matching patterns from text."""
-    if not text or not patterns:
-        return text
-    compiled = compile_patterns(patterns)
-    if compiled:
-        lines = text.split('\n')
-        filtered_lines = [line for line in lines if not compiled.match(normalize_text(line).strip().lower())]
-        return '\n'.join(filtered_lines).strip()
-    return text
+    for block in matcher.get_matching_blocks():
+        a, b, size = block
+        for i in range(size):
+            mapping[a + i] = b + i
 
-def remove_phrases(text: str, phrases: List[str]) -> Tuple[str, bool]:
-    """Remove specified phrases from text."""
-    if not text or not phrases:
-        return text, False
-    normalized_text = normalize_text(text)
-    automaton = pyahocorasick.Automaton()
-    for idx, phrase in enumerate(phrases):
-        automaton.add_word(normalize_text(phrase).lower(), (idx, phrase))
-    automaton.make_automaton()
-    found = False
-    result = []
-    last_end = 0
-    for end, (idx, phrase) in automaton.iter(normalized_text.lower()):
-        result.append(text[last_end:end - len(phrase)])
-        last_end = end
-        found = True
-    result.append(text[last_end:])
-    cleaned_text = ''.join(result)
-    return re.sub(r'\s+', ' ', cleaned_text).strip(), found
-
-def paraphrase_phrases(text: str, phrases: List[str]) -> str:
-    """Paraphrase specified phrases with synonyms."""
-    if not text or not phrases:
-        return text
-    synonym_map = {
-        'buy': ['purchase', 'acquire'],
-        'sell': ['vend', 'trade'],
-        'signal': ['indication', 'cue'],
-        'profit': ['gain', 'return']
-    }
-    normalized_text = normalize_text(text)
-    for phrase in phrases:
-        normalized_phrase = normalize_text(phrase).lower()
-        if normalized_phrase in synonym_map:
-            synonyms = synonym_map[normalized_phrase]
-            text = re.sub(
-                r'\b' + re.escape(phrase) + r'\b',
-                random.choice(synonyms),
-                text,
-                flags=re.IGNORECASE
-            )
-    return text
-
-def clean_image_exif(image: Image.Image) -> Image.Image:
-    """Remove EXIF metadata from image."""
-    try:
-        image = image.convert('RGB')
-        new_image = Image.new('RGB', image.size)
-        new_image.putdata(image.getdata())
-        return new_image
-    except Exception as e:
-        logger.error(f"Error cleaning EXIF: {e}")
-        return image
-
-def obfuscate_image(image: Image.Image) -> Image.Image:
-    """Apply subtle transformations to obfuscate image."""
-    try:
-        original_size = image.size
-        scale = random.uniform(0.98, 1.02)
-        new_size = (int(original_size[0] * scale), int(original_size[1] * scale))
-        image = image.resize(new_size, Image.LANCZOS)
-        image = image.resize(original_size, Image.LANCZOS)
-        output = io.BytesIO()
-        image.save(output, format='JPEG', quality=random.randint(90, 95))
-        return Image.open(output)
-    except Exception as e:
-        logger.error(f"Error obfuscating image: {e}")
-        return image
-
-async def process_image(event: events.NewMessage.Event, mapping: Dict[str, Any]) -> Tuple[Optional[io.BytesIO], bool]:
-    """Process image for trap detection and stealth reupload."""
-    input_path = None
-    try:
-        photo = await client.download_media(event.message, bytes)
-        if not photo:
-            logger.warning("Failed to download image.")
-            return None, False
-
-        image_hash = calculate_image_hash(photo)
-        if await is_image_cached(image_hash):
-            logger.info("Skipping cached image")
-            random_string = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
-            file_ext = 'jpg'
-            file_bytes = io.BytesIO(photo)
-            file_bytes.name = f"img_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{random_string}.{file_ext}"
-            return file_bytes, False
-
-        image = Image.open(io.BytesIO(photo))
-        original_format = image.format or 'JPEG'
-        original_size = image.size
-        image = clean_image_exif(image)
-        image = obfuscate_image(image)
-
-        phash = str(imagehash.phash(image))
-        if phash in mapping.get('trap_image_hashes', []):
-            reason = f"Block image hash match: {phash}"
-            await notify_trap(event, mapping, mapping['pair_name'], reason)
-            return None, True
-
-        random_string = ''.join(random.choices(string.ascii_lowercase + string.digits, k=8))
-        output = io.BytesIO()
-        image.save(output, format=original_format, quality=random.randint(90, 95))
-        file_ext = original_format.lower()
-        file_bytes = io.BytesIO(output.getvalue())
-        file_bytes.name = f"img_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}_{random_string}.{file_ext}"
-
-        await cache_image(image_hash)
-        return file_bytes, False
-    except Exception as e:
-        logger.error(f"Error processing image: {e}")
-        return None, False
-    finally:
-        if input_path and input_path.exists():
-            for _ in range(3):
-                try:
-                    input_path.unlink()
-                    logger.debug(f"Deleted temporary file: {input_path}")
-                    break
-                except Exception as e:
-                    logger.error(f"Failed to delete {input_path}: {e}")
-                    await asyncio.sleep(0.1)
-
-async def notify_trap(event: events.NewMessage.Event, mapping: Dict[str, Any], pair_name: str, reason: str):
-    """Notify owner of trap detection."""
-    global OWNER_ID
-    if not OWNER_ID:
-        logger.warning(f"Cannot notify trap: OWNER_ID not set. Reason: {reason} in pair '{pair_name}'")
-        return
-    msg_id = getattr(event.message, 'id', 'Unknown')
-    try:
-        await client.send_message(
-            OWNER_ID,
-            f"🚫 Block detected in pair '{pair_name}' from '{mapping['source']}'.\n"
-            f"🚫 Reason: {reason}\n🚫 Source Message ID: {msg_id}"
-        )
-        logger.info(f"Block hit: {reason} in pair '{pair_name}'")
-    except Exception as e:
-        logger.error(f"Failed to notify trap: {e}")
-
-async def send_split_message(
-    client: TelegramClient,
-    entity: int,
-    message_text: str,
-    reply_to: Optional[int] = None,
-    silent: bool = False,
-    entities: Optional[List] = None
-) -> Optional[Any]:
-    """Send long messages in parts with rate limit handling."""
-    parts = [message_text[i:i + MAX_MESSAGE_LENGTH] for i in range(0, len(message_text), MAX_MESSAGE_LENGTH)]
-    sent_messages = []
-    for attempt in range(MAX_RETRIES):
-        try:
-            for part in parts:
-                sent_msg = await client.send_message(
-                    entity=entity,
-                    message=part,
-                    reply_to=reply_to if not sent_messages else None,
-                    silent=silent,
-                    parse_mode='html',
-                    formatting_entities=entities if entities and not sent_messages else None
-                )
-                sent_messages.append(sent_msg)
-                await asyncio.sleep(random.uniform(0.1, 0.5))
-            return sent_messages[0] if sent_messages else None
-        except errors.FloodWaitError as e:
-            wait_time = e.seconds + random.uniform(0, 1)
-            logger.warning(f"Flood wait error, sleeping for {wait_time}s")
-            await asyncio.sleep(wait_time)
-        except errors.PeerFloodError:
-            logger.error("Peer flood error, stopping message send")
-            return None
-        except Exception as e:
-            logger.error(f"Error sending split message: {e}")
-            if attempt < MAX_RETRIES - 1:
-                await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
-            else:
-                raise
-    return None
-
-def adjust_entities(original_text: str, processed_text: str, entities: List[MessageEntity]) -> List[MessageEntity]:
-    """Adjust message entities to align with modified text."""
-    if not entities or not original_text or not processed_text:
-        return None
-    matcher = SequenceMatcher(None, original_text, processed_text)
     new_entities = []
-    for tag, i1, i2, j1, j2 in matcher.get_opcodes():
-        if tag == 'equal':
-            for entity in entities:
-                if entity.offset >= i1 and entity.offset + entity.length <= i2:
-                    new_offset = j1 + (entity.offset - i1)
-                    new_entities.append(entity.__class__(offset=new_offset, length=entity.length, **{
-                        k: v for k, v in entity.__dict__.items() if k not in ['offset', 'length']
-                    }))
-    return new_entities if new_entities else None
+    for entity in entities:
+        start_offset = entity.offset
+        end_offset = entity.offset + entity.length
 
-async def copy_message_with_retry(
+        new_start = mapping.get(start_offset, -1)
+        new_end = mapping.get(end_offset, -1)
+
+        if new_start != -1 and new_end != -1:
+            new_length = new_end - new_start
+            if new_length > 0:
+                try:
+                    # Recreate the entity, preserving its type and any extra attributes
+                    entity_args = {k: v for k, v in entity.to_dict().items() if k not in ['_', 'offset', 'length']}
+                    new_entity = type(entity)(offset=new_start, length=new_length, **entity_args)
+                    new_entities.append(new_entity)
+                except Exception as e:
+                    if not STEALTH_MODE:
+                        logger.warning(f"Could not reconstruct entity: {e}")
+
+    return new_entities
+
+# --- Core Message Processing ---
+async def process_and_copy_message(
     event: events.NewMessage.Event,
     mapping: Dict[str, Any],
     user_id: str,
     pair_name: str
-) -> bool:
-    """Copy message with retry logic."""
-    source_msg_id = event.message.id if hasattr(event.message, 'id') else "Unknown"
-    async with queue_semaphore:
-        for attempt in range(MAX_RETRIES):
-            try:
-                if not is_processing_enabled:
-                    logger.info(f"Processing paused for pair '{pair_name}'")
-                    await asyncio.sleep(1)
-                    continue
-                message_text = event.message.raw_text or ""
-                normalized_text = normalize_text(message_text)
-                text_lower = normalized_text.lower()
-                original_entities = event.message.entities or []
-                media = event.message.media
-                reply_to = await handle_reply_mapping(event, mapping)
-
-                compiled_honeypots = compile_patterns(mapping.get('honeypot_phrases', []))
-                if compiled_honeypots and compiled_honeypots.search(text_lower):
-                    logger.info(f"Skipped message due to honeypot phrase in pair '{pair_name}'")
-                    return True
-
-                compiled_traps = compile_patterns(mapping.get('trap_phrases', []))
-                if compiled_traps and compiled_traps.search(text_lower):
-                    reason = "Block phrase in text"
-                    await notify_trap(event, mapping, pair_name, reason)
-                    pair_stats[user_id][pair_name]['blocked'] += 1
-                    return True
-
-                processed_text = message_text
-                processed_entities = original_entities
-                if message_text:
-                    processed_text = normalized_text
-                    processed_text = remove_patterns(processed_text, mapping.get('header_patterns', []))
-                    processed_text = remove_patterns(processed_text, mapping.get('footer_patterns', []))
-                    processed_text, phrases_removed = remove_phrases(processed_text, mapping.get('remove_phrases', []))
-                    if phrases_removed:
-                        processed_text = paraphrase_phrases(processed_text, mapping.get('remove_phrases', []))
-                    if mapping.get('remove_mentions', False):
-                        processed_text = re.sub(r'@[a-zA-Z0-9_]+|t\.me/[^\s]+', '', processed_text)
-                        processed_text = re.sub(r'\s+', ' ', processed_text).strip()
-                    processed_text = apply_custom_header_footer(
-                        processed_text, mapping.get('custom_header', ''), mapping.get('custom_footer', '')
-                    )
-                    if normalize_text(processed_text).strip().lower() != normalize_text(message_text).strip().lower():
-                        processed_entities = adjust_entities(message_text, processed_text, original_entities)
-                        logger.info("Text changed, adjusted entities.")
-
-                processed_media = None
-                if isinstance(media, MessageMediaPhoto):
-                    processed_media, is_trapped = await process_image(event, mapping)
-                    if is_trapped:
-                        pair_stats[user_id][pair_name]['blocked'] += 1
-                        return True
-                    if not processed_media:
-                        logger.warning(f"Failed to process image for pair '{pair_name}'. Falling back to original.")
-                        processed_media = media
-                elif isinstance(media, MessageMediaDocument):
-                    processed_media = media
-
-                min_delay, max_delay = mapping.get('delay_range', DEFAULT_DELAY_RANGE)
-                delay_offset = mapping.get('delay_offset', DEFAULT_DELAY_OFFSET)
-                dest_jitter = hash(mapping['destination']) % 4 + random.uniform(1, 2)
-                total_delay = random.uniform(min_delay, max_delay) + dest_jitter
-                await asyncio.sleep(max(total_delay, 0))
-
-                if processed_media or processed_text.strip():
-                    sent_message = await client.send_message(
-                        entity=int(mapping['destination']),
-                        file=processed_media,
-                        message=processed_text,
-                        reply_to=reply_to,
-                        silent=event.message.silent,
-                        parse_mode='html',
-                        formatting_entities=processed_entities
-                    )
-                    await store_message_mapping(event, mapping, sent_message)
-                    pair_stats[user_id][pair_name]['forwarded'] += 1
-                    pair_stats[user_id][pair_name]['last_activity'] = datetime.now().isoformat()
-                    logger.info(f"Copied message from {mapping['source']} to {mapping['destination']} (ID: {sent_message.id})")
-                    return True
-                else:
-                    reason = "Empty message after filtering"
-                    await notify_trap(event, mapping, pair_name, reason)
-                    pair_stats[user_id][pair_name]['blocked'] += 1
-                    return True
-
-            except errors.FloodWaitError as e:
-                wait_time = e.seconds + random.uniform(0, 1)
-                logger.warning(f"Flood wait error, sleeping for {wait_time}s for pair '{pair_name}' (Msg ID: {source_msg_id})")
-                await asyncio.sleep(wait_time)
-            except errors.ChatWriteForbiddenError:
-                logger.warning(f"Bot forbidden to write in {mapping['destination']}. Pausing pair '{pair_name}'.")
-                mapping['status'] = 'paused'
-                save_mappings()
-                if OWNER_ID:
-                    await client.send_message(OWNER_ID, f"⏸️ Paused pair '{pair_name}' due to write permission error.")
-                return False
-            except errors.ChannelInvalidError:
-                logger.warning(f"Invalid channel {mapping['destination']}. Pausing pair '{pair_name}'.")
-                mapping['status'] = 'paused'
-                save_mappings()
-                if OWNER_ID:
-                    await client.send_message(OWNER_ID, f"⏸️ Paused pair '{pair_name}' due to invalid channel.")
-                return False
-            except errors.MessageIdInvalidError:
-                logger.warning(f"Invalid message ID for pair '{pair_name}'. Skipping.")
-                return False
-            except errors.PeerFloodError:
-                logger.error(f"Peer flood error for pair '{pair_name}'. Pausing pair.")
-                mapping['status'] = 'paused'
-                save_mappings()
-                if OWNER_ID:
-                    await client.send_message(OWNER_ID, f"⏸️ Paused pair '{pair_name}' due to peer flood error.")
-                return False
-            except Exception as e:
-                logger.error(f"Error copying message for pair '{pair_name}' (Msg ID: {source_msg_id}): {e}")
-                if attempt < MAX_RETRIES - 1:
-                    wait_time = RETRY_DELAY * (2 ** attempt)
-                    await asyncio.sleep(wait_time)
-                else:
-                    if OWNER_ID:
-                        await client.send_message(OWNER_ID, f"❌ Failed to copy message for pair '{pair_name}' after {MAX_RETRIES} attempts.")
-                    return False
-
-async def edit_copied_message(
-    event: events.MessageEdited.Event,
-    mapping: Dict[str, Any],
-    user_id: str,
-    pair_name: str
 ):
-    """Edit copied message in destination channel."""
-    try:
-        mapping_key = f"{mapping['source']}:{event.message.id}"
-        if mapping_key not in client.forwarded_messages:
-            return
+    """The main logic for processing and copying a single message."""
+    source_chat_id = event.chat_id
+    source_msg_id = event.message.id
+    dest_chat_id = int(mapping['destination'])
 
-        forwarded_msg_id = client.forwarded_messages[mapping_key]
-        message_text = event.message.raw_text or ""
-        normalized_text = normalize_text(message_text)
-        text_lower = normalized_text.lower()
-        original_entities = event.message.entities or []
-        media = event.message.media
-        reply_to = await handle_reply_mapping(event, mapping)
-
-        compiled_honeypots = compile_patterns(mapping.get('honeypot_phrases', []))
-        if compiled_honeypots and compiled_honeypots.search(text_lower):
-            await client.delete_messages(int(mapping['destination']), [forwarded_msg_id])
-            return
-
-        compiled_traps = compile_patterns(mapping.get('trap_phrases', []))
-        if compiled_traps and compiled_traps.search(text_lower):
-            reason = "Block phrase in edited text"
-            await notify_trap(event, mapping, pair_name, reason)
-            await client.delete_messages(int(mapping['destination']), [forwarded_msg_id])
-            return
-
-        processed_text = message_text
-        processed_entities = original_entities
-        if message_text:
-            processed_text = normalized_text
-            processed_text = remove_patterns(processed_text, mapping.get('header_patterns', []))
-            processed_text = remove_patterns(processed_text, mapping.get('footer_patterns', []))
-            processed_text, phrases_removed = remove_phrases(processed_text, mapping.get('remove_phrases', []))
-            if phrases_removed:
-                processed_text = paraphrase_phrases(processed_text, mapping.get('remove_phrases', []))
-            if mapping.get('remove_mentions', False):
-                processed_text = re.sub(r'@[a-zA-Z0-9_]+|t\.me/[^\s]+', '', processed_text)
-                processed_text = re.sub(r'\s+', ' ', processed_text).strip()
-            processed_text = apply_custom_header_footer(
-                processed_text, mapping.get('custom_header', ''), mapping.get('custom_footer', '')
-            )
-            if normalize_text(processed_text).strip().lower() != normalize_text(message_text).strip().lower():
-                processed_entities = adjust_entities(message_text, processed_text, original_entities)
-                logger.info("Text changed, adjusted entities.")
-
-        processed_media = None
-        if isinstance(media, MessageMediaPhoto):
-            processed_media, is_trapped = await process_image(event, mapping)
-            if is_trapped:
-                await client.delete_messages(int(mapping['destination']), [forwarded_msg_id])
+    for attempt in range(MAX_RETRIES):
+        try:
+            # --- Respect global pause ---
+            if PAUSE_ALL:
+                logger.info(f"[PAUSE_ALL] Skipping message for pair '{pair_name}' (paused globally)")
                 return
-            if not processed_media:
-                logger.warning(f"Failed to process edited image for pair '{pair_name}'. Using original media.")
-                processed_media = media
-        elif isinstance(media, MessageMediaDocument):
-            processed_media = media
+            # 1. Trap Detection
+            is_trap, reason = trap_filter.is_trap_candidate(
+                event.message.raw_text,
+                mapping.get('trap_phrases', []),
+                mapping.get('honeypot_phrases', [])
+            )
+            if is_trap:
+                if "Honeypot" not in reason:
+                    await notify_trap(event, mapping, pair_name, reason)
+                    pair_stats[user_id][pair_name]['blocked'] += 1
+                return
 
-        if not processed_text.strip() and not processed_media:
-            await client.delete_messages(int(mapping['destination']), [forwarded_msg_id])
+            # 2. Text Processing
+            processed_text = event.message.raw_text or ""
+            original_entities = event.message.entities or []
+            processed_entities = original_entities
+            if processed_text and mapping.get('remove_mentions', True):
+                processed_text = remove_mentions(processed_text)
+                processed_entities = adjust_entities(event.message.raw_text, processed_text, original_entities)
+
+            # --- Remove custom header/footer before sending ---
+            processed_text = remove_custom_header_footer(processed_text, HEADER_LIST, FOOTER_LIST)
+
+            # 3. Media Processing (Force Copy)
+            processed_media = None
+            if event.message.media:
+                try:
+                    if isinstance(event.message.media, MessageMediaPhoto):
+                        image_bytes = await client.download_media(event.message, bytes)
+                        if image_bytes:
+                            processed_media, is_trap, reason = await stealth_utils.process_stealth_image(
+                                image_bytes, mapping.get('trap_image_hashes', [])
+                            )
+                            if is_trap:
+                                await notify_trap(event, mapping, pair_name, reason)
+                                pair_stats[user_id][pair_name]['blocked'] += 1
+                                return
+                    else: # Handle all other media types (videos, documents, etc.)
+                        # Download to a BytesIO object to re-upload
+                        processed_media = io.BytesIO()
+                        await client.download_media(event.message, processed_media)
+                        processed_media.seek(0)
+                        # Preserve original filename if possible
+                        if hasattr(event.message.media.document, 'attributes'):
+                            for attr in event.message.media.document.attributes:
+                                if hasattr(attr, 'file_name'):
+                                    processed_media.name = attr.file_name
+                                    break
+                except Exception as e:
+                    logger.error(f"Failed to process media for pair '{pair_name}': {e}", exc_info=True)
+                    return # Skip message if media fails
+
+            # 4. Final Check
+            if not processed_text.strip() and not processed_media:
+                await notify_trap(event, mapping, pair_name, "Message empty after filtering")
+                pair_stats[user_id][pair_name]['blocked'] += 1
+                return
+
+            # 5. Handle Replies
+            reply_to_id = None
+            if event.message.reply_to:
+                source_reply_id = event.message.reply_to.reply_to_msg_id
+                reply_to_id = await reply_mapper.get_dest_message_id(source_chat_id, source_reply_id, dest_chat_id)
+
+            # 6. Apply Delay
+            min_delay, max_delay = mapping.get('delay_range', DEFAULT_DELAY_RANGE)
+            await asyncio.sleep(random.uniform(min_delay, max_delay))
+
+            # 7. Send Message
+            sent_message = await client.send_message(
+                entity=dest_chat_id,
+                message=processed_text,
+                file=processed_media,
+                reply_to=reply_to_id,
+                silent=event.message.silent,
+                formatting_entities=processed_entities
+            )
+
+            # 8. Store Mapping & Stats
+            if sent_message:
+                await reply_mapper.store_message_mapping(source_chat_id, source_msg_id, dest_chat_id, sent_message.id)
+                pair_stats[user_id][pair_name]['forwarded'] += 1
+                pair_stats[user_id][pair_name]['last_activity'] = datetime.now(timezone.utc).isoformat()
+                if not STEALTH_MODE:
+                    logger.info(f"Copied message for pair '{pair_name}'")
+            
+            return # Success, exit retry loop
+
+        except (errors.FloodWaitError, errors.PeerFloodError) as e:
+            wait_time = e.seconds if hasattr(e, 'seconds') else RETRY_DELAY * (2 ** attempt)
+            logger.warning(f"Network flood error for '{pair_name}'. Attempt {attempt + 1}/{MAX_RETRIES}. Retrying in {wait_time}s.")
+            await asyncio.sleep(wait_time + random.uniform(1, 3))
+        except (errors.ChatWriteForbiddenError, errors.ChannelInvalidError) as e:
+            logger.error(f"Cannot write to {mapping['destination']} for pair '{pair_name}'. Pausing. Error: {e}")
+            mapping['status'] = 'paused'
+            save_mappings()
+            return
+        except errors.MessageIdInvalidError:
+            logger.warning(f"Invalid message ID for reply in '{pair_name}'. Sending without reply.")
+            reply_to_id = None # Clear reply_to and retry
+            continue # Go to next attempt without sleeping
+        except Exception as e:
+            logger.error(f"Unhandled error in process_and_copy_message for '{pair_name}' (Attempt {attempt + 1}): {e}", exc_info=True)
+            if attempt < MAX_RETRIES - 1:
+                await asyncio.sleep(RETRY_DELAY * (2 ** attempt))
+            else:
+                logger.critical(f"Failed to copy message for '{pair_name}' after {MAX_RETRIES} attempts.")
+                return
+
+async def notify_trap(event, mapping, pair_name, reason):
+    """Notify of trap detection (logging only, no owner message)."""
+    msg_id = getattr(event.message, 'id', 'Unknown')
+    logger.warning(f"Block detected in pair '{pair_name}' from '{mapping['source']}'. Reason: {reason}. Source Message ID: {msg_id}")
+
+# --- Event Handlers ---
+def is_in_pause_window() -> bool:
+    """Check if the current time is within the defined pause window (IST)."""
+    if not PAUSE_WINDOW:
+        return False
+    
+    ist = pytz.timezone('Asia/Kolkata')
+    now_ist = datetime.now(ist).time()
+    
+    start, end = PAUSE_WINDOW
+    
+    # Handle overnight window (e.g., 22:00 to 06:00)
+    if start > end:
+        return now_ist >= start or now_ist < end
+    else:
+        return start <= now_ist < end
+
+@client.on(events.NewMessage)
+async def on_new_message(event: events.NewMessage.Event):
+    """Main handler for incoming messages."""
+    if not is_processing_enabled or not is_connected:
+        return
+
+    if is_in_pause_window():
+        if not STEALTH_MODE:
+            logger.info("Global pause window is active. Suppressing forwarding.")
+        return
+    
+    source_chat_id = str(event.chat_id)
+    
+    destinations = []
+    for user_id, pairs in channel_mappings.items():
+        for pair_name, mapping in pairs.items():
+            if mapping['status'] == 'active' and mapping['source'] == source_chat_id:
+                destinations.append((event, mapping, user_id, pair_name))
+    
+    if not destinations:
+        return
+
+    random.shuffle(destinations)
+    for dest_info in destinations:
+        if len(message_queue) < MAX_QUEUE_SIZE:
+            message_queue.append(dest_info)
+            user_id, pair_name = dest_info[2], dest_info[3]
+            pair_stats[user_id][pair_name]['queued'] += 1
+        else:
+            logger.warning(f"Queue is full. Dropping message for pair '{dest_info[3]}'.")
+
+@client.on(events.MessageEdited)
+async def on_message_edited(event: events.MessageEdited.Event):
+    """Handle message edits to keep copies in sync."""
+    if not is_processing_enabled or not is_connected:
+        return
+
+    if is_in_pause_window():
+        if not STEALTH_MODE:
+            logger.info("Global pause window is active. Suppressing message edit.")
+        return
+
+    source_chat_id = str(event.chat_id)
+    source_msg_id = event.message.id
+
+    dest_messages = await reply_mapper.get_all_dest_messages(source_chat_id, source_msg_id)
+    if not dest_messages:
+        return
+
+    for dest_chat_id, dest_msg_id in dest_messages:
+        found = False
+        for user_id, pairs in channel_mappings.items():
+            for pair_name, mapping in pairs.items():
+                if mapping['source'] == source_chat_id and mapping['destination'] == str(dest_chat_id):
+                    found = True
+                    try:
+                        # Re-run filters on the edited content
+                        is_trap, reason = trap_filter.is_trap_candidate(
+                            event.message.raw_text,
+                            mapping.get('trap_phrases', []),
+                            mapping.get('honeypot_phrases', [])
+                        )
+                        if is_trap:
+                            await client.delete_messages(dest_chat_id, [dest_msg_id])
+                            if "Honeypot" not in reason:
+                                await notify_trap(event, mapping, pair_name, f"Message deleted on edit: {reason}")
+                            continue
+                        cleaned_text = event.message.raw_text or ""
+                        original_entities = event.message.entities or []
+                        if mapping.get('remove_mentions', True):
+                            cleaned_text = remove_mentions(cleaned_text)
+                        cleaned_text = remove_custom_header_footer(cleaned_text, HEADER_LIST, FOOTER_LIST)
+                        cleaned_entities = adjust_entities(event.message.raw_text, cleaned_text, original_entities)
+                        if not cleaned_text.strip() and not event.message.media:
+                            await client.delete_messages(dest_chat_id, [dest_msg_id])
+                            await notify_trap(event, mapping, pair_name, "Message deleted on edit: empty after filtering")
+                            continue
+                        await asyncio.sleep(random.uniform(2.0, 5.0))
+                        try:
+                            await client.edit_message(
+                                entity=dest_chat_id,
+                                message=dest_msg_id,
+                                text=cleaned_text,
+                                entities=cleaned_entities
+                            )
+                            pair_stats[user_id][pair_name]['edited'] += 1
+                            if not STEALTH_MODE:
+                                logger.info(f"Edited message in pair '{pair_name}'")
+                        except errors.MessageNotModifiedError:
+                            logger.info(f"Message not modified for pair '{pair_name}' (no changes)")
+                        except errors.MessageIdInvalidError:
+                            logger.warning(f"Invalid message ID for edit in pair '{pair_name}'")
+                        except errors.FloodWaitError as e:
+                            logger.warning(f"Flood wait error while editing message in pair '{pair_name}': {e}")
+                        except Exception as e:
+                            logger.error(f"Error editing message for pair '{pair_name}': {e}", exc_info=True)
+                    except Exception as e:
+                        logger.error(f"Error in edit sync for pair '{pair_name}': {e}", exc_info=True)
+        if not found:
+            logger.warning(f"No mapping found for edited message {source_msg_id} in chat {source_chat_id} -> {dest_chat_id}")
+
+@client.on(events.MessageDeleted)
+async def on_message_deleted(event: events.MessageDeleted.Event):
+    """Handle message deletions to keep copies in sync."""
+    if not is_processing_enabled or not is_connected or not event.deleted_ids:
+        return
+
+    if is_in_pause_window():
+        if not STEALTH_MODE:
+            logger.info("Global pause window is active. Suppressing message deletion.")
+        return
+
+    source_chat_id = str(event.chat_id)
+    
+    for deleted_id in event.deleted_ids:
+        dest_messages = await reply_mapper.get_all_dest_messages(source_chat_id, deleted_id)
+        if not dest_messages:
+            continue
+
+        for dest_chat_id, dest_msg_id in dest_messages:
+            try:
+                await client.delete_messages(dest_chat_id, [dest_msg_id])
+                
+                # Correctly find the user and pair to update stats
+                user_to_update = None
+                pair_to_update = None
+                for user_id, pairs in channel_mappings.items():
+                    for pair_name, mapping in pairs.items():
+                        if mapping['source'] == source_chat_id and mapping['destination'] == str(dest_chat_id):
+                            user_to_update = user_id
+                            pair_to_update = pair_name
+                            break
+                    if user_to_update:
+                        break
+                
+                if user_to_update and pair_to_update:
+                    pair_stats[user_to_update][pair_to_update]['deleted'] += 1
+
+                if not STEALTH_MODE:
+                    logger.info(f"Deleted message {dest_msg_id} from chat {dest_chat_id}")
+            except Exception as e:
+                logger.error(f"Error deleting message {dest_msg_id}: {e}")
+
+# --- Bot Commands ---
+@client.on(events.NewMessage(pattern='/traptest'))
+async def traptest_command(event: events.NewMessage.Event):
+    """Command to test why a message would be blocked."""
+    if not event.reply_to_msg_id:
+        await event.reply("Reply to a message to test it.")
+        return
+        
+    replied_msg = await event.get_reply_message()
+    
+    # Test text
+    is_trap, reason = trap_filter.is_trap_candidate(
+        replied_msg.raw_text,
+        ['trapword', 'blockthis'], # Example trap words
+        ['do_not_copy'] # Example honeypot
+    )
+    text_report = f"Text Analysis:\n- Is Trap: {is_trap}\n- Reason: {reason}\n"
+    
+    # Test image
+    image_report = "Image Analysis:\n- No image found.\n"
+    if isinstance(replied_msg.media, MessageMediaPhoto):
+        image_bytes = await client.download_media(replied_msg, bytes)
+        if image_bytes:
+            _, is_trap, reason = await stealth_utils.process_stealth_image(
+                image_bytes, ['some_fake_hash'] # Example hash
+            )
+            image_report = f"Image Analysis:\n- Is Trap: {is_trap}\n- Reason: {reason or 'Clean'}\n"
+
+    await event.reply(f"🕵️ Trap Test Report:\n\n{text_report}\n{image_report}")
+
+@client.on(events.NewMessage(pattern=r'/addblockimage (\S+)'))
+async def add_block_image_command(event: events.NewMessage.Event):
+    """Adds an image's perceptual hashes to the block list for a pair."""
+    try:
+        pair_name = event.pattern_match.group(1).strip()
+        user_id = str(event.sender_id)
+
+        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
+            await event.reply("❌ Pair not found.")
             return
 
-        await client.edit_message(
-            entity=int(mapping['destination']),
-            message=forwarded_msg_id,
-            text=processed_text,
-            file=processed_media,
-            parse_mode='html',
-            formatting_entities=processed_entities
+        if not event.message.reply_to:
+            await event.reply("🖼️ Please reply to a photo to block it.")
+            return
+            
+        replied_msg = await event.get_reply_message()
+        if not isinstance(replied_msg.media, MessageMediaPhoto):
+            await event.reply("🖼️ The replied message is not a photo.")
+            return
+
+        image_bytes = await client.download_media(replied_msg, bytes)
+        if not image_bytes:
+            await event.reply("❌ Failed to download photo.")
+            return
+
+        image = Image.open(io.BytesIO(image_bytes))
+        hashes = stealth_utils.get_image_hashes(image)
+        
+        if not hashes:
+            await event.reply("❌ Could not generate hashes for this image.")
+            return
+
+        trap_list = channel_mappings[user_id][pair_name].setdefault('trap_image_hashes', [])
+        new_hashes = []
+        for hash_type, hash_value in hashes.items():
+            if hash_value not in trap_list:
+                trap_list.append(hash_value)
+                new_hashes.append(f"{hash_type}: {hash_value}")
+
+        if new_hashes:
+            save_mappings()
+            await event.reply(f"🚫 Added {len(new_hashes)} new image hashes to block list for '{pair_name}':\n" + "\n".join(new_hashes))
+            logger.info(f"Added {len(new_hashes)} image hashes to pair '{pair_name}' for user {user_id}")
+        else:
+            await event.reply("✅ All hashes for this image are already in the block list.")
+
+    except Exception as e:
+        logger.error(f"Error in /addblockimage: {e}")
+        await event.reply("❌ An error occurred while adding the block image.")
+
+@client.on(events.NewMessage(pattern='/flushcache'))
+async def flush_cache_command(event: events.NewMessage.Event):
+    await reply_mapper.flush_mappings()
+    # Also clear any file-based caches if they exist
+    await event.reply("✅ All reply mappings have been flushed.")
+
+@client.on(events.NewMessage(pattern=r'/setpair (\S+) (\S+) (\S+)'))
+async def set_pair_command(event: events.NewMessage.Event):
+    """Sets up a new source-destination pair."""
+    try:
+        pair_name, source, dest = event.pattern_match.groups()
+        user_id = str(event.sender_id)
+        
+        channel_mappings.setdefault(user_id, {})
+        pair_stats.setdefault(user_id, {})
+
+        channel_mappings[user_id][pair_name] = {
+            'source': source,
+            'destination': dest,
+            'status': 'active',
+            'remove_mentions': True,
+            'trap_phrases': ['do_not_copy', 'trapword'],
+            'honeypot_phrases': [],
+            'trap_image_hashes': [],
+            'delay_range': DEFAULT_DELAY_RANGE,
+        }
+        pair_stats[user_id][pair_name] = {'forwarded': 0, 'edited': 0, 'deleted': 0, 'blocked': 0, 'queued': 0, 'last_activity': None}
+        
+        save_mappings()
+        await event.reply(f"✅ Pair '{pair_name}' created: {source} -> {dest}")
+    except Exception as e:
+        await event.reply(f"❌ Error setting pair: {e}")
+
+@client.on(events.NewMessage(pattern=r'/delpair (\S+)'))
+async def del_pair_command(event: events.NewMessage.Event):
+    """Deletes a forwarding pair."""
+    try:
+        pair_name = event.pattern_match.group(1)
+        user_id = str(event.sender_id)
+        if channel_mappings.get(user_id, {}).pop(pair_name, None):
+            pair_stats.get(user_id, {}).pop(pair_name, None)
+            save_mappings()
+            await event.reply(f"✅ Pair '{pair_name}' deleted.")
+        else:
+            await event.reply("❌ Pair not found.")
+    except (IndexError, Exception) as e:
+        await event.reply(f"❌ Error deleting pair. Usage: /delpair <pair_name>. Error: {e}")
+
+@client.on(events.NewMessage(pattern='/listpairs'))
+async def list_pairs_command(event: events.NewMessage.Event):
+    user_id = str(event.sender_id)
+    if not channel_mappings.get(user_id):
+        await event.reply("No pairs configured.")
+        return
+    
+    reply = "📜 Configured Pairs:\n\n"
+    for name, m in channel_mappings[user_id].items():
+        reply += f"**{name}**: {m['source']} -> {m['destination']} (Status: {m['status']})\n"
+    
+    await event.reply(reply)
+
+@client.on(events.NewMessage(pattern=r'/stealthmode (\S+)'))
+async def stealth_mode_command(event: events.NewMessage.Event):
+    try:
+        mode = event.pattern_match.group(1).lower()
+        if mode == "on":
+            setup_logging(stealth=True)
+            await event.reply("Stealth mode **ON**. Logging is now minimal.")
+        elif mode == "off":
+            setup_logging(stealth=False)
+            await event.reply("Stealth mode **OFF**. Verbose logging is enabled.")
+        else:
+            await event.reply("Usage: /stealthmode <on|off>")
+    except IndexError:
+        await event.reply(f"Stealth mode is currently **{'ON' if STEALTH_MODE else 'OFF'}**.\nUsage: /stealthmode <on|off>")
+
+@client.on(events.NewMessage(pattern='/report'))
+async def report_command(event: events.NewMessage.Event):
+    user_id = str(event.sender_id)
+    if not pair_stats.get(user_id):
+        await event.reply("No stats to report.")
+        return
+
+    report = "📊 **Bot Activity Report**\n\n"
+    for name, stats in pair_stats[user_id].items():
+        report += (
+            f"**Pair: {name}**\n"
+            f"  - Forwarded: {stats['forwarded']}\n"
+            f"  - Edited: {stats['edited']}\n"
+            f"  - Deleted: {stats['deleted']}\n"
+            f"  - Blocked: {stats['blocked']}\n"
+            f"  - Queued: {len(message_queue)}/{MAX_QUEUE_SIZE}\n"
+            f"  - Last Activity: {stats.get('last_activity', 'N/A')}\n\n"
         )
-        pair_stats[user_id][pair_name]['edited'] += 1
-        pair_stats[user_id][pair_name]['last_activity'] = datetime.now().isoformat()
-        logger.info(f"Edited copied message {forwarded_msg_id} in {mapping['destination']}")
-    except errors.MessageIdInvalidError:
-        logger.warning(f"Invalid message ID {forwarded_msg_id} for pair '{pair_name}'. Skipping edit.")
-    except Exception as e:
-        logger.error(f"Error editing message for pair '{pair_name}': {e}")
+    await event.reply(report)
 
-async def delete_copied_message(
-    event: events.MessageDeleted.Event,
-    mapping: Dict[str, Any],
-    user_id: str,
-    pair_name: str
-):
-    """Delete copied message in destination channel."""
+@client.on(events.NewMessage(pattern=r'/setpausewindow (\S+) (\S+)'))
+async def set_pause_window_command(event: events.NewMessage.Event):
+    global PAUSE_WINDOW
     try:
-        for msg_id in event.deleted_ids:
-            mapping_key = f"{mapping['source']}:{msg_id}"
-            if mapping_key in client.forwarded_messages:
-                forwarded_msg_id = client.forwarded_messages[mapping_key]
-                await client.delete_messages(int(mapping['destination']), [forwarded_msg_id])
-                pair_stats[user_id][pair_name]['deleted'] += 1
-                pair_stats[user_id][pair_name]['last_activity'] = datetime.now().isoformat()
-                del client.forwarded_messages[mapping_key]
-                logger.info(f"Deleted copied message {forwarded_msg_id} in {mapping['destination']}")
-    except errors.MessageIdInvalidError:
-        logger.warning(f"Invalid message ID {forwarded_msg_id} for pair '{pair_name}'. Skipping deletion.")
-    except Exception as e:
-        logger.error(f"Error deleting copied message for pair '{pair_name}': {e}")
+        start_str, end_str = event.pattern_match.groups()
+        start_time = time.fromisoformat(start_str)
+        end_time = time.fromisoformat(end_str)
+        
+        PAUSE_WINDOW = [start_time, end_time]
+        
+        # Save it to the mappings file
+        mappings_data = channel_mappings
+        mappings_data['pause_window'] = [start_time.isoformat(), end_time.isoformat()]
+        with open(MAPPINGS_FILE, "w") as f:
+            json.dump(mappings_data, f, indent=2)
 
-async def handle_reply_mapping(event: events.NewMessage.Event, mapping: Dict[str, Any]) -> Optional[int]:
-    """Handle reply message mapping."""
-    if not hasattr(event.message, 'reply_to') or not event.message.reply_to:
-        return None
+        await event.reply(f"✅ Global pause window set from {start_str} to {end_str} IST.")
+        logger.info(f"Global pause window set: {start_str} - {end_str} IST")
+    except (ValueError, TypeError):
+        await event.reply("❌ Invalid time format. Use HH:MM (e.g., /setpausewindow 23:00 07:00).")
+    except Exception as e:
+        await event.reply(f"❌ An error occurred: {e}")
+
+@client.on(events.NewMessage(pattern='/clearpausewindow'))
+async def clear_pause_window_command(event: events.NewMessage.Event):
+    global PAUSE_WINDOW
+    PAUSE_WINDOW = None
+    
+    # Correctly load, modify, and save the entire mappings file
     try:
-        source_reply_id = event.message.reply_to.reply_to_msg_id
-        mapping_key = f"{mapping['source']}:{source_reply_id}"
-        if mapping_key in client.forwarded_messages:
-            return client.forwarded_messages[mapping_key]
-        logger.info(f"No forwarded message found for reply ID {source_reply_id} in pair '{mapping.get('pair_name', 'unknown')}'")
-        return None
-    except Exception as e:
-        logger.error(f"Error handling reply mapping for pair '{mapping.get('pair_name', 'unknown')}': {e}")
-        return None
+        with open(MAPPINGS_FILE, "r") as f:
+            mappings_data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        mappings_data = {} # Start fresh if file is missing/corrupt
 
-async def store_message_mapping(event: events.NewMessage.Event, mapping: Dict[str, Any], sent_message: Any):
-    """Store message mapping for tracking."""
-    try:
-        if not hasattr(event.message, 'id'):
-            return
-        mapping_key = f"{mapping['source']}:{event.message.id}"
-        if len(client.forwarded_messages) >= MAX_MAPPING_HISTORY:
-            oldest_key = next(iter(client.forwarded_messages))
-            client.forwarded_messages.pop(oldest_key)
-        client.forwarded_messages[mapping_key] = sent_message.id
-        logger.info(f"Stored message mapping for pair '{mapping.get('pair_name', 'unknown')}': {mapping_key} -> {sent_message.id}")
-    except Exception as e:
-        logger.error(f"Error storing message mapping for pair '{mapping.get('pair_name', 'unknown')}': {e}")
+    if 'pause_window' in mappings_data:
+        del mappings_data['pause_window']
+    
+    with open(MAPPINGS_FILE, "w") as f:
+        json.dump(mappings_data, f, indent=2)
+        
+    await event.reply("✅ Global pause window cleared.")
+    logger.info("Global pause window cleared.")
 
-def apply_custom_header_footer(text: str, header: str, footer: str) -> str:
-    """Apply custom header and footer to text."""
-    if not text:
-        return text
-    result = text
+@client.on(events.NewMessage(pattern='/testcopy'))
+async def test_copy_command(event: events.NewMessage.Event):
+    """Simulates the full copy process for a replied-to message."""
+    if not event.reply_to_msg_id:
+        await event.reply("Reply to a message to test the copy process.")
+        return
+        
+    replied_msg = await event.get_reply_message()
+    
+    report = "🧪 **Copy Simulation Report**\n\n"
+    
+    # 1. Text Processing
+    original_text = replied_msg.raw_text or ""
+    processed_text = remove_mentions(original_text)
+    report += f"**Original Text:**\n`{original_text}`\n\n"
+    report += f"**Processed Text (Mentions Removed):**\n`{processed_text}`\n\n"
+    
+    # 2. Entity Adjustment
+    original_entities = replied_msg.entities or []
+    new_entities = adjust_entities(original_text, processed_text, original_entities)
+    report += f"**Entities:**\n- Original Count: {len(original_entities)}\n- Adjusted Count: {len(new_entities)}\n\n"
+
+    # 3. Media Processing
+    media_report = "**Media Processing:**\n- No media found.\n"
+    if replied_msg.media:
+        if isinstance(replied_msg.media, MessageMediaPhoto):
+            try:
+                image_bytes = await client.download_media(replied_msg, bytes)
+                _, is_trap, reason = await stealth_utils.process_stealth_image(image_bytes, [])
+                media_report = (
+                    f"**Media Processing (Image):**\n"
+                    f"- Is Trap: {is_trap}\n"
+                    f"- Reason: {reason or 'Clean'}\n"
+                    f"- Obfuscation would be applied.\n"
+                )
+            except Exception as e:
+                media_report = f"**Media Processing (Image):**\n- Error: {e}\n"
+        else:
+            media_report = f"**Media Processing (Other):**\n- Type: {type(replied_msg.media).__name__}\n- Would be downloaded and re-uploaded.\n"
+    
+    report += media_report
+    
+    await event.reply(report, parse_mode='markdown')
+
+@client.on(events.NewMessage(pattern='/help'))
+async def help_command(event: events.NewMessage.Event):
+    """Lists all available bot commands and their usage."""
+    help_text = (
+        "📖 **GhostCopyBotPro Commands**\n\n"
+        "/help - Show this help message\n"
+        "/traptest - Test why a message would be blocked (reply to a message)\n"
+        "/addblockimage <pair_name> - Add a photo's hashes to block list (reply to a photo)\n"
+        "/flushcache - Flush all reply mappings\n"
+        "/setpair <pair_name> <source> <destination> - Create a new forwarding pair\n"
+        "/delpair <pair_name> - Delete a forwarding pair\n"
+        "/listpairs - List all configured pairs\n"
+        "/stealthmode <on|off> - Toggle stealth mode (logging)\n"
+        "/report - Show a statistical report of bot activity\n"
+        "/setpausewindow <start> <end> - Set the global pause window (HH:MM HH:MM)\n"
+        "/clearpausewindow - Clear the global pause window\n"
+        "/testcopy - Simulate the copy process for a replied-to message\n"
+        "\n"
+        "*Some commands may be restricted if OWNER_ID is not set.*"
+    )
+    await event.reply(help_text, parse_mode='markdown')
+
+@client.on(events.NewMessage(pattern=r'/setheader (.+)'))
+async def set_header_command(event: events.NewMessage.Event):
+    """Set a custom header to remove from all messages."""
+    global HEADER_LIST
+    header = event.pattern_match.group(1).strip()
     if header:
-        result = header + '\n' + result
-    if footer:
-        result = result + '\n' + footer
-    return result.strip()
+        if header not in HEADER_LIST:
+            HEADER_LIST.append(header)
+            await event.reply(f"✅ Header added: `{header}`")
+        else:
+            await event.reply(f"ℹ️ Header already exists: `{header}`")
+    else:
+        await event.reply("❌ Usage: /setheader <header text>")
 
-async def process_queue():
-    """Process messages from the queue concurrently."""
+@client.on(events.NewMessage(pattern=r'/setfooter (.+)'))
+async def set_footer_command(event: events.NewMessage.Event):
+    """Set a custom footer to remove from all messages."""
+    global FOOTER_LIST
+    footer = event.pattern_match.group(1).strip()
+    if footer:
+        if footer not in FOOTER_LIST:
+            FOOTER_LIST.append(footer)
+            await event.reply(f"✅ Footer added: `{footer}`")
+        else:
+            await event.reply(f"ℹ️ Footer already exists: `{footer}`")
+    else:
+        await event.reply("❌ Usage: /setfooter <footer text>")
+
+@client.on(events.NewMessage(pattern='/clearhf'))
+async def clear_hf_command(event: events.NewMessage.Event):
+    """Clear all custom headers and footers."""
+    global HEADER_LIST, FOOTER_LIST
+    HEADER_LIST.clear()
+    FOOTER_LIST.clear()
+    await event.reply("✅ All headers and footers have been cleared.")
+
+@client.on(events.NewMessage(pattern='/pauseall'))
+async def pause_all_command(event: events.NewMessage.Event):
+    """Pause message copying globally."""
+    global PAUSE_ALL, PAUSE_ALL_LOG
+    PAUSE_ALL = True
+    PAUSE_ALL_LOG = datetime.now(timezone.utc).isoformat()
+    await event.reply("⏸️ All message copying is now globally paused.")
+    logger.info("Global pause activated by command.")
+
+@client.on(events.NewMessage(pattern='/resumeall'))
+async def resume_all_command(event: events.NewMessage.Event):
+    """Resume all forwarding globally."""
+    global PAUSE_ALL, PAUSE_ALL_LOG
+    PAUSE_ALL = False
+    PAUSE_ALL_LOG = None
+    await event.reply("▶️ All message copying has been resumed.")
+    logger.info("Global pause deactivated by command.")
+
+# --- Main Application Logic ---
+async def queue_processor():
+    """The main worker loop that processes messages from the queue."""
     while not shutdown_event.is_set():
         try:
             if message_queue:
-                event, mapping, user_id, pair_name, queued_time = message_queue.popleft()
+                event, mapping, user_id, pair_name = message_queue.popleft()
                 async with queue_semaphore:
-                    await copy_message_with_retry(event, mapping, user_id, pair_name)
+                    await process_and_copy_message(event, mapping, user_id, pair_name)
             else:
                 await asyncio.sleep(0.1)
         except Exception as e:
-            logger.error(f"Queue processing error: {e}")
+            logger.error(f"Critical error in queue_processor: {e}", exc_info=True)
             await asyncio.sleep(1)
 
-@client.on(events.NewMessage)
-async def copy_messages(event: events.NewMessage.Event):
-    """Handle new messages for copying."""
+async def periodic_task_runner():
+    """Runs periodic maintenance tasks."""
+    while not shutdown_event.is_set():
+        await asyncio.sleep(3600) # Run every hour
+        try:
+            await reply_mapper.cleanup_old_mappings()
+        except Exception as e:
+            logger.error(f"Error during periodic cleanup: {e}")
+
+def shutdown_handler(sig, frame):
+    """Handle shutdown signals gracefully."""
+    logger.warning("Shutdown signal received. Shutting down gracefully...")
+    shutdown_event.set()
+
+async def main():
+    """Main entry point for the bot."""
+    global is_connected, OWNER_ID
+    
+    setup_logging()
+    await initialize_databases()
+    load_mappings()
+    
+    signal.signal(signal.SIGINT, shutdown_handler)
+    signal.signal(signal.SIGTERM, shutdown_handler)
+
+    # Start worker tasks
+    worker_tasks = [asyncio.create_task(queue_processor()) for _ in range(NUM_WORKERS)]
+    periodic_task = asyncio.create_task(periodic_task_runner())
+    
+    logger.info("GhostCopyBotPro is starting...")
+    await client.start()
+    is_connected = True
+    logger.info("Client connected successfully.")
+    
+    await shutdown_event.wait()
+    
+    # Graceful shutdown
+    is_connected = False
+    logger.info("Stopping worker tasks...")
+    for task in worker_tasks:
+        task.cancel()
+    periodic_task.cancel()
+    await asyncio.gather(*worker_tasks, periodic_task, return_exceptions=True)
+    
+    await client.disconnect()
+    logger.info("Client disconnected. Shutdown complete.")
+
+if __name__ == "__main__":
     try:
-        if not is_processing_enabled or not is_connected:
-            return
-        destinations = []
-        for user_id, pairs in channel_mappings.items():
-            for pair_name, mapping in pairs.items():
-                if mapping['status'] != 'active':
-                    continue
-                source_id = str(event.chat_id)
-                if source_id == mapping['source']:
-                    mapping['pair_name'] = pair_name
-                    destinations.append((event, mapping, user_id, pair_name, datetime.now()))
-        random.shuffle(destinations)  # Randomize post order for stealth
-        for dest in destinations:
-            if len(message_queue) >= MAX_QUEUE_SIZE:
-                logger.warning(f"Queue full, dropping message for pair '{dest[3]}'")
-                continue
-            message_queue.append(dest)
-            pair_stats[dest[2]][dest[3]]['queued'] += 1
-            logger.debug(f"Queued message for pair '{dest[3]}'")
-    except Exception as e:
-        logger.error(f"Error in copy_messages handler: {e}")
-
-@client.on(events.MessageEdited)
-async def handle_message_edit(event: events.MessageEdited.Event):
-    """Handle edited messages."""
-    try:
-        if not is_processing_enabled or not is_connected:
-            return
-        for user_id, pairs in channel_mappings.items():
-            for pair_name, mapping in pairs.items():
-                if mapping['status'] != 'active':
-                    continue
-                source_id = str(event.chat_id)
-                if source_id == mapping['source']:
-                    mapping['pair_name'] = pair_name
-                    await edit_copied_message(event, mapping, user_id, pair_name)
-    except Exception as e:
-        logger.error(f"Error in handle_message_edit: {e}")
-
-@client.on(events.MessageDeleted)
-async def handle_message_delete(event: events.MessageDeleted.Event):
-    """Handle deleted messages."""
-    try:
-        if not is_processing_enabled or not is_connected:
-            return
-        for user_id, pairs in channel_mappings.items():
-            for pair_name, mapping in pairs.items():
-                if mapping['status'] != 'active':
-                    continue
-                source_id = str(event.chat_id)
-                if source_id == mapping['source']:
-                    mapping['pair_name'] = pair_name
-                    await delete_copied_message(event, mapping, user_id, pair_name)
-    except Exception as e:
-        logger.error(f"Error in handle_message_delete: {e}")
-
-@client.on(events.NewMessage(pattern='(?i)^/commands$'))
-async def list_commands(event: events.NewMessage.Event):
-    """List available bot commands."""
-    global OWNER_ID
-    if OWNER_ID is None:
-        OWNER_ID = event.sender_id
-        logger.info(f"Set OWNER_ID to {OWNER_ID} via /commands")
-    try:
-        commands = """
-🚀 GhostCopyBotPro Commands
-
-**Setup & Management**
-- `/setowner <user_id>` - Set owner ID for notifications
-- `/setpair <name> <source> <dest> [yes|no]` - Add pair (yes/no for mentions)
-- `/listpairs` - Show all pairs
-- `/pausepair <name>` - Pause a pair
-- `/resumepair <name>` - Resume a pair
-- `/pauseall` - Pause all pairs
-- `/resumeall` - Resume all pairs
-- `/clearpairs` - Remove all pairs
-- `/setdelay <name> <min> <max> [offset]` - Set delay range and offset
-- `/status <name>` - Check pair status
-- `/report` - View pair stats
-- `/monitor` - Detailed pair monitor
-- `/healthcheck` - Check session load
-- `/flushcache` - Clear image and reply mappings
-- `/stealthcheck` - Simulate stealth repost
-
-**🧽 Text Cleaning**
-- `/addheader <pair> <pattern>` - Add header to remove
-- `/removeheader <pair> <pattern>` - Remove header
-- `/addfooter <pair> <pattern>` - Add footer to remove
-- `/removefooter <pair> <pattern>` - Remove footer
-- `/addremoveword <pair> <phrase>` - Add phrase to remove
-- `/removeword <pair> <phrase>` - Remove phrase
-- `/enablementionremoval <pair>` - Enable mention removal
-- `/disablementionremoval <pair>` - Disable mention removal
-- `/showfilters <pair>` - Show text filters
-- `/setcustomheader <pair> <text>` - Set custom header
-- `/setcustomfooter <pair> <text>` - Set custom footer
-- `/clearcustomheaderfooter <pair>` - Clear custom text
-- `/addhoneypot <pair> <phrase>` - Add honeypot phrase
-- `/removehoneypot <pair> <phrase>` - Remove honeypot phrase
-- `/showhoneypots <pair>` - Show honeypot phrases
-
-**🚫 Block Filters**
-- `/addblockword <pair> <word>` - Add block phrase
-- `/removeblockword <pair> <word>` - Remove block phrase
-- `/addblockimage <pair>` - Add block image (reply to image)
-- `/removeblockimage <pair> <hash>` - Remove block image hash
-- `/showblocks <pair>` - Show block filters
-"""
-        await event.reply(commands)
-        logger.info(f"Bot commands listed by user {event.sender_id}")
-    except Exception as e:
-        logger.error(f"Error listing commands: {e}")
-        await event.reply("❌ Failed to list commands.")
-
-@client.on(events.NewMessage(pattern=r'/setowner (\d+)'))
-async def set_owner(event: events.NewMessage.Event):
-    """Set OWNER_ID for notifications."""
-    global OWNER_ID
-    try:
-        new_owner_id = int(event.pattern_match.group(1))
-        OWNER_ID = new_owner_id
-        save_mappings()
-        await event.reply(f"✅ Set OWNER_ID to {new_owner_id}.")
-        logger.info(f"Set OWNER_ID to {new_owner_id} by user {event.sender_id}")
-    except ValueError:
-        await event.reply("❌ Invalid user ID format.")
-    except Exception as e:
-        logger.error(f"Error setting OWNER_ID: {e}")
-        await event.reply("❌ Failed to set OWNER_ID.")
-
-@client.on(events.NewMessage(pattern=r'/stealthcheck'))
-async def stealth_check(event: events.NewMessage.Event):
-    """Simulate a stealth repost to test filters and processing."""
-    try:
-        if not event.message.reply_to:
-            await event.reply("🚀 Please reply to a message to test stealth repost.")
-            return
-        replied_msg = await event.get_reply_message()
-        user_id = str(event.sender_id)
-        pair_name = "stealth_test"
-        mapping = {
-            'source': str(event.chat_id),
-            'destination': str(event.chat_id),
-            'pair_name': pair_name,
-            'status': 'active',
-            'remove_mentions': True,
-            'header_patterns': [],
-            'footer_patterns': [],
-            'remove_phrases': [],
-            'trap_phrases': [],
-            'honeypot_phrases': ['do_not_copy'],
-            'trap_image_hashes': [],
-            'delay_range': [0, 0],
-            'delay_offset': 0,
-            'custom_header': '',
-            'custom_footer': ''
-        }
-
-        message_text = replied_msg.raw_text or ""
-        normalized_text = normalize_text(message_text)
-        text_lower = normalized_text.lower()
-        original_entities = replied_msg.entities or []
-        media = replied_msg.media
-
-        compiled_honeypots = compile_patterns(mapping.get('honeypot_phrases', []))
-        if compiled_honeypots and compiled_honeypots.search(text_lower):
-            await event.reply("🚫 Message contains honeypot phrase, would be skipped.")
-            return
-
-        compiled_traps = compile_patterns(mapping.get('trap_phrases', []))
-        if compiled_traps and compiled_traps.search(text_lower):
-            await event.reply("🚫 Message contains trap phrase, would be blocked.")
-            return
-
-        processed_text = message_text
-        processed_entities = original_entities
-        if message_text:
-            processed_text = normalized_text
-            processed_text = remove_patterns(processed_text, mapping.get('header_patterns', []))
-            processed_text = remove_patterns(processed_text, mapping.get('footer_patterns', []))
-            processed_text, phrases_removed = remove_phrases(processed_text, mapping.get('remove_phrases', []))
-            if phrases_removed:
-                processed_text = paraphrase_phrases(processed_text, mapping.get('remove_phrases', []))
-            if mapping.get('remove_mentions', False):
-                processed_text = re.sub(r'@[a-zA-Z0-9_]+|t\.me/[^\s]+', '', processed_text)
-                processed_text = re.sub(r'\s+', ' ', processed_text).strip()
-            processed_text = apply_custom_header_footer(
-                processed_text, mapping.get('custom_header', ''), mapping.get('custom_footer', '')
-            )
-            if normalize_text(processed_text).strip().lower() != normalize_text(message_text).strip().lower():
-                processed_entities = adjust_entities(message_text, processed_text, original_entities)
-
-        processed_media = None
-        if isinstance(media, MessageMediaPhoto):
-            processed_media, is_trapped = await process_image(replied_msg, mapping)
-            if is_trapped:
-                await event.reply("🚫 Image contains trap content, would be blocked.")
-                return
-            if not processed_media:
-                logger.warning(f"Failed to process image for stealth check.")
-                processed_media = media
-
-        if not processed_text.strip() and not processed_media:
-            await event.reply("🚫 Message empty after filtering, would be blocked.")
-            return
-
-        await client.send_message(
-            event.chat_id,
-            file=processed_media,
-            message=processed_text,
-            reply_to=replied_msg.id,
-            parse_mode='html',
-            formatting_entities=processed_entities
-        )
-        await event.reply("🚀 Stealth repost simulation successful. Check the processed message above.")
-        logger.info(f"Stealth check performed by user {event.sender_id}")
-    except Exception as e:
-        logger.error(f"Error in stealth check: {e}")
-        await event.reply("❌ Failed to perform stealth check.")
-
-@client.on(events.NewMessage(pattern=r'/healthcheck'))
-async def health_check(event: events.NewMessage.Event):
-    """Check session load."""
-    try:
-        pair_count = sum(len(pairs) for pairs in channel_mappings.values())
-        health_report = [
-            f"🚀 Health Check:",
-            f"Active Pairs: {pair_count}/{MAX_CHATS_PER_SESSION}",
-            f"Queue Size: {len(message_queue)}/{MAX_QUEUE_SIZE}",
-            f"Connected: {'Yes' if is_connected else 'No'}",
-            f"Processing Enabled: {'Yes' if is_processing_enabled else 'No'}",
-            f"Owner ID Set: {'Yes' if OWNER_ID else 'No'}"
-        ]
-        await event.reply("\n".join(health_report))
-        logger.info(f"Health check performed by user {event.sender_id}")
-    except Exception as e:
-        logger.error(f"Error performing health check: {e}")
-        await event.reply("❌ Failed to perform health check.")
-
-@client.on(events.NewMessage(pattern=r'/flushcache'))
-async def flush_cache(event: events.NewMessage.Event):
-    """Clear image and reply mappings cache."""
-    try:
-        async with aiosqlite.connect(CACHE_DB_PATH) as db:
-            await db.execute("DELETE FROM image_cache")
-            await db.commit()
-        client.forwarded_messages.clear()
-        await event.reply("🧹 Image and reply mappings cache cleared.")
-        logger.info(f"Cache flushed by user {event.sender_id}")
-    except Exception as e:
-        logger.error(f"Error flushing cache: {e}")
-        await event.reply("❌ Failed to flush cache.")
-
-@client.on(events.NewMessage(pattern=r'/setpair (\S+) (\S+) (\S+)(?: (yes|no))?'))
-async def set_pair(event: events.NewMessage.Event):
-    """Set up a new source-destination pair."""
-    try:
-        pair_name, source, destination, remove_mentions = event.pattern_match.groups()
-        user_id = str(event.sender_id)
-        pair_name = pair_name.strip()
-        remove_mentions = remove_mentions == "yes"
-        total_pairs = sum(len(pairs) for pairs in channel_mappings.values())
-        if total_pairs >= MAX_CHATS_PER_SESSION:
-            await event.reply(f"❌ Maximum number of pairs ({MAX_CHATS_PER_SESSION}) reached.")
-            return
-        if user_id not in channel_mappings:
-            channel_mappings[user_id] = {}
-        if user_id not in pair_stats:
-            pair_stats[user_id] = {}
-        channel_mappings[user_id][pair_name] = {
-            'source': source.strip(),
-            'destination': destination.strip(),
-            'status': 'active',
-            'remove_mentions': remove_mentions,
-            'header_patterns': [],
-            'footer_patterns': [],
-            'remove_phrases': [],
-            'trap_phrases': [],
-            'honeypot_phrases': ['do_not_copy', 'trapword'],
-            'trap_image_hashes': [],
-            'delay_range': DEFAULT_DELAY_RANGE,
-            'delay_offset': DEFAULT_DELAY_OFFSET,
-            'custom_header': '',
-            'custom_footer': '',
-            'last_activity': None
-        }
-        pair_stats[user_id][pair_name] = {'forwarded': 0, 'edited': 0, 'deleted': 0, 'blocked': 0, 'queued': 0, 'last_activity': None}
-        save_mappings()
-        await event.reply(f"✅ Pair '{pair_name}' added: {source} ➡️ {destination}\nMentions removal: {'✅' if remove_mentions else '❌'}")
-        logger.info(f"Set pair '{pair_name}' for user {user_id}: {source} -> {destination}")
-    except Exception as e:
-        logger.error(f"Error setting pair: {e}")
-        await event.reply("❌ Failed to set pair.")
-
-@client.on(events.NewMessage(pattern=r'/listpairs'))
-async def list_pairs(event: events.NewMessage.Event):
-    """List all channel pairs."""
-    try:
-        user_id = str(event.sender_id)
-        if user_id not in channel_mappings or not channel_mappings[user_id]:
-            await event.reply("❌ No pairs configured.")
-            return
-        pairs_info = [f"📜 Pairs for user {user_id}:"]
-        for pair_name, mapping in channel_mappings[user_id].items():
-            status = mapping['status']
-            pairs_info.append(
-                f"Pair: {pair_name} | Source: {mapping['source']} ➡️ Dest: {mapping['destination']} | "
-                f"Status: {status} | Mentions: {'✅' if mapping['remove_mentions'] else '❌'}"
-            )
-        await event.reply("\n".join(pairs_info))
-        logger.info(f"Listed pairs for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error listing pairs: {e}")
-        await event.reply("❌ Failed to list pairs.")
-
-@client.on(events.NewMessage(pattern=r'/pausepair (\S+)'))
-async def pause_pair(event: events.NewMessage.Event):
-    """Pause a specific pair."""
-    try:
-        pair_name = event.pattern_match.group(1).strip()
-        user_id = str(event.sender_id)
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        channel_mappings[user_id][pair_name]['status'] = 'paused'
-        save_mappings()
-        await event.reply(f"⏸️ Pair '{pair_name}' paused.")
-        logger.info(f"Paused pair '{pair_name}' for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error pausing pair: {e}")
-        await event.reply("❌ Failed to pause pair.")
-
-@client.on(events.NewMessage(pattern=r'/resumepair (\S+)'))
-async def resume_pair(event: events.NewMessage.Event):
-    """Resume a specific pair."""
-    try:
-        pair_name = event.pattern_match.group(1).strip()
-        user_id = str(event.sender_id)
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        channel_mappings[user_id][pair_name]['status'] = 'active'
-        save_mappings()
-        await event.reply(f"▶️ Pair '{pair_name}' resumed.")
-        logger.info(f"Resumed pair '{pair_name}' for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error resuming pair: {e}")
-        await event.reply("❌ Failed to resume pair.")
-
-@client.on(events.NewMessage(pattern=r'/pauseall'))
-async def pause_all(event: events.NewMessage.Event):
-    """Pause all pairs."""
-    try:
-        user_id = str(event.sender_id)
-        if user_id not in channel_mappings:
-            await event.reply("❌ No pairs configured.")
-            return
-        for pair_name in channel_mappings[user_id]:
-            channel_mappings[user_id][pair_name]['status'] = 'paused'
-        save_mappings()
-        await event.reply("⏸️ All pairs paused.")
-        logger.info(f"Paused all pairs for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error pausing all pairs: {e}")
-        await event.reply("❌ Failed to pause all pairs.")
-
-@client.on(events.NewMessage(pattern=r'/resumeall'))
-async def resume_all(event: events.NewMessage.Event):
-    """Resume all pairs."""
-    try:
-        user_id = str(event.sender_id)
-        if user_id not in channel_mappings:
-            await event.reply("❌ No pairs configured.")
-            return
-        for pair_name in channel_mappings[user_id]:
-            channel_mappings[user_id][pair_name]['status'] = 'active'
-        save_mappings()
-        await event.reply("▶️ All pairs resumed.")
-        logger.info(f"Resumed all pairs for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error resuming all pairs: {e}")
-        await event.reply("❌ Failed to resume all pairs.")
-
-@client.on(events.NewMessage(pattern=r'/clearpairs'))
-async def clear_pairs(event: events.NewMessage.Event):
-    """Clear all pairs."""
-    try:
-        user_id = str(event.sender_id)
-        if user_id in channel_mappings:
-            del channel_mappings[user_id]
-            del pair_stats[user_id]
-            save_mappings()
-            await event.reply("🧹 All pairs cleared.")
-            logger.info(f"Cleared all pairs for user {user_id}")
-        else:
-            await event.reply("❌ No pairs to clear.")
-    except Exception as e:
-        logger.error(f"Error clearing pairs: {e}")
-        await event.reply("❌ Failed to clear pairs.")
-
-@client.on(events.NewMessage(pattern=r'/setdelay (\S+) (\d+\.?\d*) (\d+\.?\d*) ?(\d+\.?\d*)?'))
-async def set_delay(event: events.NewMessage.Event):
-    """Set delay range and offset for a pair."""
-    try:
-        pair_name, min_delay, max_delay, offset = event.pattern_match.groups()
-        user_id = str(event.sender_id)
-        pair_name = pair_name.strip()
-        min_delay = float(min_delay)
-        max_delay = float(max_delay)
-        offset = float(offset) if offset else DEFAULT_DELAY_OFFSET
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        if min_delay > max_delay:
-            await event.reply("❌ Min delay must be less than or equal to max delay.")
-            return
-        channel_mappings[user_id][pair_name]['delay_range'] = [min_delay, max_delay]
-        channel_mappings[user_id][pair_name]['delay_offset'] = offset
-        save_mappings()
-        await event.reply(f"⏱️ Set delay for '{pair_name}': {min_delay}s–{max_delay}s, offset {offset}s")
-        logger.info(f"Set delay for pair '{pair_name}' for user {user_id}: {min_delay}–{max_delay}s, offset {offset}s")
-    except Exception as e:
-        logger.error(f"Error setting delay: {e}")
-        await event.reply("❌ Failed to set delay.")
-
-@client.on(events.NewMessage(pattern=r'/status (\S+)'))
-async def check_status(event: events.NewMessage.Event):
-    """Check status of a pair."""
-    try:
-        pair_name = event.pattern_match.group(1).strip()
-        user_id = str(event.sender_id)
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        mapping = channel_mappings[user_id][pair_name]
-        stats = pair_stats[user_id][pair_name]
-        status_info = [
-            f"📊 Status for pair '{pair_name}':",
-            f"Source: {mapping['source']}",
-            f"Destination: {mapping['destination']}",
-            f"Status: {mapping['status']}",
-            f"Last Activity: {stats['last_activity'] or 'None'}",
-            f"Forwarded: {stats['forwarded']}",
-            f"Edited: {stats['edited']}",
-            f"Deleted: {stats['deleted']}",
-            f"Blocked: {stats['blocked']}",
-            f"Queued: {stats['queued']}"
-        ]
-        await event.reply("\n".join(status_info))
-        logger.info(f"Checked status for pair '{pair_name}' for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error checking status: {e}")
-        await event.reply("❌ Failed to check status.")
-
-@client.on(events.NewMessage(pattern=r'/report'))
-async def report(event: events.NewMessage.Event):
-    """View stats for all pairs."""
-    try:
-        user_id = str(event.sender_id)
-        if user_id not in channel_mappings:
-            await event.reply("❌ No pairs configured.")
-            return
-        report_info = [f"📈 Report for user {user_id}:"]
-        for pair_name, stats in pair_stats[user_id].items():
-            mapping = channel_mappings[user_id][pair_name]
-            report_info.append(
-                f"Pair: {pair_name} | Status: {mapping['status']} | "
-                f"Forwarded: {stats['forwarded']} | Blocked: {stats['blocked']} | "
-                f"Last: {stats['last_activity'] or 'None'}"
-            )
-        await event.reply("\n".join(report_info))
-        logger.info(f"Generated report for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error generating report: {e}")
-        await event.reply("❌ Failed to generate report.")
-
-@client.on(events.NewMessage(pattern=r'/monitor'))
-async def monitor(event: events.NewMessage.Event):
-    """Detailed monitor of all pairs."""
-    try:
-        user_id = str(event.sender_id)
-        if user_id not in channel_mappings:
-            await event.reply("❌ No pairs configured.")
-            return
-        monitor_info = [f"🔍 Monitor for user {user_id}:"]
-        for pair_name, mapping in channel_mappings[user_id].items():
-            stats = pair_stats[user_id][pair_name]
-            monitor_info.append(
-                f"Pair: {pair_name}\n"
-                f"Source: {mapping['source']} ➡️ Dest: {mapping['destination']}\n"
-                f"Status: {mapping['status']} | Mentions: {'✅' if mapping['remove_mentions'] else '❌'}\n"
-                f"Delay: {mapping['delay_range'][0]}–{mapping['delay_range'][1]}s, offset {mapping['delay_offset']}s\n"
-                f"Forwarded: {stats['forwarded']} | Edited: {stats['edited']} | Deleted: {stats['deleted']} | "
-                f"Blocked: {stats['blocked']} | Queued: {stats['queued']}\n"
-                f"Last Activity: {stats['last_activity'] or 'None'}\n"
-            )
-        await send_split_message(client, event.chat_id, "\n".join(monitor_info))
-        logger.info(f"Generated monitor for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error generating monitor: {e}")
-        await event.reply("❌ Failed to generate monitor.")
-
-@client.on(events.NewMessage(pattern=r'/addheader (\S+) (.+)'))
-async def add_header(event: events.NewMessage.Event):
-    """Add header pattern to remove."""
-    try:
-        pair_name, pattern = event.pattern_match.groups()
-        user_id = str(event.sender_id)
-        pair_name = pair_name.strip()
-        pattern = pattern.strip()
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        if pattern not in channel_mappings[user_id][pair_name]['header_patterns']:
-            channel_mappings[user_id][pair_name]['header_patterns'].append(pattern)
-            save_mappings()
-            await event.reply(f"🧽 Added header pattern for '{pair_name}': {pattern}")
-            logger.info(f"Added header pattern '{pattern}' to pair '{pair_name}' for user {user_id}")
-        else:
-            await event.reply(f"⏸️ Header pattern already exists in '{pair_name}'.")
-    except Exception as e:
-        logger.error(f"Error adding header: {e}")
-        await event.reply("❌ Failed to add header.")
-
-@client.on(events.NewMessage(pattern=r'/removeheader (\S+) (.+)'))
-async def remove_header(event: events.NewMessage.Event):
-    """Remove header pattern."""
-    try:
-        pair_name, pattern = event.pattern_match.groups()
-        user_id = str(event.sender_id)
-        pair_name = pair_name.strip()
-        pattern = pattern.strip()
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        if pattern in channel_mappings[user_id][pair_name]['header_patterns']:
-            channel_mappings[user_id][pair_name]['header_patterns'].remove(pattern)
-            save_mappings()
-            await event.reply(f"🧽 Removed header pattern from '{pair_name}': {pattern}")
-            logger.info(f"Removed header pattern '{pattern}' from pair '{pair_name}' for user {user_id}")
-        else:
-            await event.reply(f"❌ Header pattern not found in '{pair_name}'.")
-    except Exception as e:
-        logger.error(f"Error removing header: {e}")
-        await event.reply("❌ Failed to remove header.")
-
-@client.on(events.NewMessage(pattern=r'/addfooter (\S+) (.+)'))
-async def add_footer(event: events.NewMessage.Event):
-    """Add footer pattern to remove."""
-    try:
-        pair_name, pattern = event.pattern_match.groups()
-        user_id = str(event.sender_id)
-        pair_name = pair_name.strip()
-        pattern = pattern.strip()
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        if pattern not in channel_mappings[user_id][pair_name]['footer_patterns']:
-            channel_mappings[user_id][pair_name]['footer_patterns'].append(pattern)
-            save_mappings()
-            await event.reply(f"🧽 Added footer pattern for '{pair_name}': {pattern}")
-            logger.info(f"Added footer pattern '{pattern}' to pair '{pair_name}' for user {user_id}")
-        else:
-            await event.reply(f"⏸️ Footer pattern already exists in '{pair_name}'.")
-    except Exception as e:
-        logger.error(f"Error adding footer: {e}")
-        await event.reply("❌ Failed to add footer.")
-
-@client.on(events.NewMessage(pattern=r'/removefooter (\S+) (.+)'))
-async def remove_footer(event: events.NewMessage.Event):
-    """Remove footer pattern."""
-    try:
-        pair_name, pattern = event.pattern_match.groups()
-        user_id = str(event.sender_id)
-        pair_name = pair_name.strip()
-        pattern = pattern.strip()
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        if pattern in channel_mappings[user_id][pair_name]['footer_patterns']:
-            channel_mappings[user_id][pair_name]['footer_patterns'].remove(pattern)
-            save_mappings()
-            await event.reply(f"🧽 Removed footer pattern from '{pair_name}': {pattern}")
-            logger.info(f"Removed footer pattern '{pattern}' from pair '{pair_name}' for user {user_id}")
-        else:
-            await event.reply(f"❌ Footer pattern not found in '{pair_name}'.")
-    except Exception as e:
-        logger.error(f"Error removing footer: {e}")
-        await event.reply("❌ Failed to remove footer.")
-
-@client.on(events.NewMessage(pattern=r'/addremoveword (\S+) (.+)'))
-async def add_remove_word(event: events.NewMessage.Event):
-    """Add phrase to remove."""
-    try:
-        pair_name, phrase = event.pattern_match.groups()
-        user_id = str(event.sender_id)
-        pair_name = pair_name.strip()
-        phrase = phrase.strip()
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        if phrase not in channel_mappings[user_id][pair_name]['remove_phrases']:
-            channel_mappings[user_id][pair_name]['remove_phrases'].append(phrase)
-            save_mappings()
-            await event.reply(f"🧽 Added phrase to remove for '{pair_name}': {phrase}")
-            logger.info(f"Added remove phrase '{phrase}' to pair '{pair_name}' for user {user_id}")
-        else:
-            await event.reply(f"⏸️ Phrase already exists in '{pair_name}'.")
-    except Exception as e:
-        logger.error(f"Error adding remove word: {e}")
-        await event.reply("❌ Failed to add remove word.")
-
-@client.on(events.NewMessage(pattern=r'/removeword (\S+) (.+)'))
-async def remove_word(event: events.NewMessage.Event):
-    """Remove phrase from removal list."""
-    try:
-        pair_name, phrase = event.pattern_match.groups()
-        user_id = str(event.sender_id)
-        pair_name = pair_name.strip()
-        phrase = phrase.strip()
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        if phrase in channel_mappings[user_id][pair_name]['remove_phrases']:
-            channel_mappings[user_id][pair_name]['remove_phrases'].remove(phrase)
-            save_mappings()
-            await event.reply(f"🧽 Removed phrase from '{pair_name}': {phrase}")
-            logger.info(f"Removed phrase '{phrase}' from pair '{pair_name}' for user {user_id}")
-        else:
-            await event.reply(f"❌ Phrase not found in '{pair_name}'.")
-    except Exception as e:
-        logger.error(f"Error removing phrase: {e}")
-        await event.reply("❌ Failed to remove phrase.")
-
-@client.on(events.NewMessage(pattern=r'/enablementionremoval (\S+)'))
-async def enable_mention_removal(event: events.NewMessage.Event):
-    """Enable mention removal for a pair."""
-    try:
-        pair_name = event.pattern_match.group(1).strip()
-        user_id = str(event.sender_id)
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        channel_mappings[user_id][pair_name]['remove_mentions'] = True
-        save_mappings()
-        await event.reply(f"✅ Mention removal enabled for '{pair_name}'.")
-        logger.info(f"Enabled mention removal for pair '{pair_name}' for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error enabling mention removal: {e}")
-        await event.reply("❌ Failed to enable mention removal.")
-
-@client.on(events.NewMessage(pattern=r'/disablementionremoval (\S+)'))
-async def disable_mention_removal(event: events.NewMessage.Event):
-    """Disable mention removal for a pair."""
-    try:
-        pair_name = event.pattern_match.group(1).strip()
-        user_id = str(event.sender_id)
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        channel_mappings[user_id][pair_name]['remove_mentions'] = False
-        save_mappings()
-        await event.reply(f"❌ Mention removal disabled for '{pair_name}'.")
-        logger.info(f"Disabled mention removal for pair '{pair_name}' for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error disabling mention removal: {e}")
-        await event.reply("❌ Failed to disable mention removal.")
-
-@client.on(events.NewMessage(pattern=r'/showfilters (\S+)'))
-async def show_filters(event: events.NewMessage.Event):
-    """Show text filters for a pair."""
-    try:
-        pair_name = event.pattern_match.group(1).strip()
-        user_id = str(event.sender_id)
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        mapping = channel_mappings[user_id][pair_name]
-        filters_info = [
-            f"🧽 Filters for pair '{pair_name}':",
-            f"Headers: {', '.join(mapping['header_patterns']) or 'None'}",
-            f"Footers: {', '.join(mapping['footer_patterns']) or 'None'}",
-            f"Remove Phrases: {', '.join(mapping['remove_phrases']) or 'None'}",
-            f"Mention Removal: {'✅' if mapping['remove_mentions'] else '❌'}",
-            f"Custom Header: {mapping['custom_header'] or 'None'}",
-            f"Custom Footer: {mapping['custom_footer'] or 'None'}"
-        ]
-        await event.reply("\n".join(filters_info))
-        logger.info(f"Showed filters for pair '{pair_name}' for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error showing filters: {e}")
-        await event.reply("❌ Failed to show filters.")
-
-@client.on(events.NewMessage(pattern=r'/setcustomheader (\S+) (.+)'))
-async def set_custom_header(event: events.NewMessage.Event):
-    """Set custom header for a pair."""
-    try:
-        pair_name, header = event.pattern_match.groups()
-        user_id = str(event.sender_id)
-        pair_name = pair_name.strip()
-        header = header.strip()
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        channel_mappings[user_id][pair_name]['custom_header'] = header
-        save_mappings()
-        await event.reply(f"🧽 Set custom header for '{pair_name}': {header}")
-        logger.info(f"Set custom header '{header}' for pair '{pair_name}' for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error setting custom header: {e}")
-        await event.reply("❌ Failed to set custom header.")
-
-@client.on(events.NewMessage(pattern=r'/setcustomfooter (\S+) (.+)'))
-async def set_custom_footer(event: events.NewMessage.Event):
-    """Set custom footer for a pair."""
-    try:
-        pair_name, footer = event.pattern_match.groups()
-        user_id = str(event.sender_id)
-        pair_name = pair_name.strip()
-        footer = footer.strip()
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        channel_mappings[user_id][pair_name]['custom_footer'] = footer
-        save_mappings()
-        await event.reply(f"🧽 Set custom footer for '{pair_name}': {footer}")
-        logger.info(f"Set custom footer '{footer}' for pair '{pair_name}' for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error setting custom footer: {e}")
-        await event.reply("❌ Failed to set custom footer.")
-
-@client.on(events.NewMessage(pattern=r'/clearcustomheaderfooter (\S+)'))
-async def clear_custom_header_footer(event: events.NewMessage.Event):
-    """Clear custom header and footer for a pair."""
-    try:
-        pair_name = event.pattern_match.group(1).strip()
-        user_id = str(event.sender_id)
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        channel_mappings[user_id][pair_name]['custom_header'] = ''
-        channel_mappings[user_id][pair_name]['custom_footer'] = ''
-        save_mappings()
-        await event.reply(f"🧹 Cleared custom header and footer for '{pair_name}'.")
-        logger.info(f"Cleared custom header/footer for pair '{pair_name}' for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error clearing custom header/footer: {e}")
-        await event.reply("❌ Failed to clear custom header/footer.")
-
-@client.on(events.NewMessage(pattern=r'/addblockword (\S+) (.+)'))
-async def add_block_word(event: events.NewMessage.Event):
-    """Add a trap phrase to block."""
-    try:
-        pair_name, phrase = event.pattern_match.groups()
-        user_id = str(event.sender_id)
-        pair_name = pair_name.strip()
-        phrase = phrase.strip()
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        if phrase not in channel_mappings[user_id][pair_name]['trap_phrases']:
-            channel_mappings[user_id][pair_name]['trap_phrases'].append(phrase)
-            save_mappings()
-            await event.reply(f"🚫 Added block phrase for '{pair_name}': {phrase}")
-            logger.info(f"Added block phrase '{phrase}' to pair '{pair_name}' for user {user_id}")
-        else:
-            await event.reply(f"⏸️ Block phrase already exists in '{pair_name}'.")
-    except Exception as e:
-        logger.error(f"Error adding block word: {e}")
-        await event.reply("❌ Failed to add block word.")
-
-@client.on(events.NewMessage(pattern=r'/removeblockword (\S+) (.+)'))
-async def remove_block_word(event: events.NewMessage.Event):
-    """Remove a trap phrase from block list."""
-    try:
-        pair_name, phrase = event.pattern_match.groups()
-        user_id = str(event.sender_id)
-        pair_name = pair_name.strip()
-        phrase = phrase.strip()
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        if phrase in channel_mappings[user_id][pair_name]['trap_phrases']:
-            channel_mappings[user_id][pair_name]['trap_phrases'].remove(phrase)
-            save_mappings()
-            await event.reply(f"🚫 Removed block phrase from '{pair_name}': {phrase}")
-            logger.info(f"Removed block phrase '{phrase}' from pair '{pair_name}' for user {user_id}")
-        else:
-            await event.reply(f"❌ Block phrase not found in '{pair_name}'.")
-    except Exception as e:
-        logger.error(f"Error removing block word: {e}")
-        await event.reply("❌ Failed to remove block word.")
-
-@client.on(events.NewMessage(pattern=r'/addblockimage (\S+)'))
-async def add_block_image(event: events.NewMessage.Event):
-    """Add an image’s perceptual hash to block list."""
-    try:
-        pair_name = event.pattern_match.group(1).strip()
-        user_id = str(event.sender_id)
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        if not event.message.reply_to or not isinstance(event.message.reply_to.media, MessageMediaPhoto):
-            await event.reply("🖼️ Please reply to a photo to block.")
-            return
-        replied_msg = await event.get_reply_message()
-        photo = await client.download_media(replied_msg, bytes)
-        if not photo:
-            await event.reply("❌ Failed to download photo.")
-            return
-        image = Image.open(io.BytesIO(photo))
-        phash = str(imagehash.phash(image))
-        if phash not in channel_mappings[user_id][pair_name]['trap_image_hashes']:
-            channel_mappings[user_id][pair_name]['trap_image_hashes'].append(phash)
-            save_mappings()
-            await event.reply(f"🚫 Added block image hash for '{pair_name}': {phash}")
-            logger.info(f"Added block image hash '{phash}' to pair '{pair_name}' for user {user_id}")
-        else:
-            await event.reply(f"⏸️ Image hash already exists in '{pair_name}'.")
-    except Exception as e:
-        logger.error(f"Error adding block image: {e}")
-        await event.reply("❌ Failed to add block image.")
-
-@client.on(events.NewMessage(pattern=r'/removeblockimage (\S+) (\S+)'))
-async def remove_block_image(event: events.NewMessage.Event):
-    """Remove an image’s perceptual hash from block list."""
-    try:
-        pair_name, phash = event.pattern_match.groups()
-        user_id = str(event.sender_id)
-        pair_name = pair_name.strip()
-        phash = phash.strip()
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        if phash in channel_mappings[user_id][pair_name]['trap_image_hashes']:
-            channel_mappings[user_id][pair_name]['trap_image_hashes'].remove(phash)
-            save_mappings()
-            await event.reply(f"🚫 Removed block image hash from '{pair_name}': {phash}")
-            logger.info(f"Removed block image hash '{phash}' from pair '{pair_name}' for user {user_id}")
-        else:
-            await event.reply(f"❌ Image hash not found in '{pair_name}'.")
-    except Exception as e:
-        logger.error(f"Error removing block image: {e}")
-        await event.reply("❌ Failed to remove block image.")
-
-@client.on(events.NewMessage(pattern=r'/showblocks (\S+)'))
-async def show_blocks(event: events.NewMessage.Event):
-    """Show block filters for a pair."""
-    try:
-        pair_name = event.pattern_match.group(1).strip()
-        user_id = str(event.sender_id)
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        mapping = channel_mappings[user_id][pair_name]
-        blocks_info = [
-            f"🚫 Block Filters for pair '{pair_name}':",
-            f"Trap Phrases: {', '.join(mapping['trap_phrases']) or 'None'}",
-            f"Trap Image Hashes: {', '.join(mapping['trap_image_hashes']) or 'None'}"
-        ]
-        await event.reply("\n".join(blocks_info))
-        logger.info(f"Showed block filters for pair '{pair_name}' for user {user_id}")
-    except Exception as e:
-        logger.error(f"Error showing block filters: {e}")
-        await event.reply("❌ Failed to show block filters.")
-
-@client.on(events.NewMessage(pattern=r'/addhoneypot (\S+) (.+)'))
-async def add_honeypot(event: events.NewMessage.Event):
-    """Add a honeypot phrase."""
-    try:
-        pair_name, phrase = event.pattern_match.groups()
-        user_id = str(event.sender_id)
-        pair_name = pair_name.strip()
-        phrase = phrase.strip()
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        if phrase not in channel_mappings[user_id][pair_name]['honeypot_phrases']:
-            channel_mappings[user_id][pair_name]['honeypot_phrases'].append(phrase)
-            save_mappings()
-            await event.reply(f"🪤 Added honeypot phrase for '{pair_name}': {phrase}")
-            logger.info(f"Added honeypot phrase '{phrase}' to pair '{pair_name}' for user {user_id}")
-        else:
-            await event.reply(f"⏸️ Honeypot phrase already exists in '{pair_name}'.")
-    except Exception as e:
-        logger.error(f"Error adding honeypot phrase: {e}")
-        await event.reply("❌ Failed to add honeypot phrase.")
-
-@client.on(events.NewMessage(pattern=r'/removehoneypot (\S+) (.+)'))
-async def remove_honeypot(event: events.NewMessage.Event):
-    """Remove a honeypot phrase."""
-    try:
-        pair_name, phrase = event.pattern_match.groups()
-        user_id = str(event.sender_id)
-        pair_name = pair_name.strip()
-        phrase = phrase.strip()
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
-            return
-        if phrase in channel_mappings[user_id][pair_name]['honeypot_phrases']:
-            channel_mappings[user_id][pair_name]['honeypot_phrases'].remove(phrase)
-            save_mappings()
-            await event.reply(f"🪤 Removed honeypot phrase from '{pair_name}': {phrase}")
-            logger.info(f"Removed honeypot phrase '{phrase}' from pair '{pair_name}' for user {user_id}")
-        else:
-            await event.reply(f"❌ Honeypot phrase not found in '{pair_name}'.")
-    except Exception as e:
-        logger.error(f"Error removing honeypot phrase: {e}")
-        await event.reply("❌ Failed to remove honeypot phrase.")
-
-@client.on(events.NewMessage(pattern=r'/showhoneypots (\S+)'))
-async def show_honeypots(event: events.NewMessage.Event):
-    """Show honeypot phrases for a pair."""
-    try:
-        pair_name = event.pattern_match.group(1).strip()
-        user_id = str(event.sender_id)
-        if user_id not in channel_mappings or pair_name not in channel_mappings[user_id]:
-            await event.reply("❌ Pair not found.")
+        asyncio.run(main())
+    except (ValueError, TypeError) as e:
+        # Catches the API_ID/HASH errors before the loop starts
+        logger.critical(f"Configuration Error: {e}")
